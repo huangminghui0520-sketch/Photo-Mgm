@@ -15,7 +15,6 @@ class LogParserEngineSampleTest {
     private fun t(ms: Long): LocalTime = Instant.ofEpochMilli(ms).atZone(zone).toLocalTime()
     private fun d(ms: Long): LocalDate = Instant.ofEpochMilli(ms).atZone(zone).toLocalDate()
 
-    // §3.5 黄金样本原文（巡查日期 2026-09-03，89 行；首尾说明段与 ```text 标记在实际生产环境不会出现，按用户确认 Q3 不需过滤）
     private val SAMPLE = """
 上午8点 与早班巡查人员张某某、李某某在A收费管理中心进行交接班，检查巡查装备齐全完好，车况正常，开启粤E00001车载视频监控，视频清晰，已报监控中心。记录人：王某某。
 08时00分 与早班巡查人员张某某、李某某在A收费管理中心进行交接班，检查巡查装备齐全完好，车况正常，开启粤E00001车载视频监控，视频清晰，已报监控中心。记录人：王某某。
@@ -134,7 +133,6 @@ class LogParserEngineSampleTest {
         assertEquals("交接班", first.eventType)
         assertEquals("A收费管理中心", first.location)
         assertEquals(t(first.startTimeMs!!), LocalTime.of(8, 0))
-        // 上午8点 与 08时00分 合并为 1 条（早班）；另 18:05 晚班交接班 1 条 → 共 2 条交接班
         assertEquals(2, r.events.count { it.eventType == "交接班" })
     }
 
@@ -199,7 +197,6 @@ class LogParserEngineSampleTest {
     @Test fun `联合巡查共7条`() {
         val r = parse()
         val joins = r.events.filter { it.eventType == "联合巡查" }
-        // 15:00 联合交警 1 条 + 19:40~20:30 联合养护/燃气/电力/通信/铁路/管廊 6 条 = 7 条
         assertEquals(7, joins.size)
     }
 
@@ -217,7 +214,6 @@ class LogParserEngineSampleTest {
 
     @Test fun `返回施工点继续检查归涉路施工`() {
         val r = parse()
-        // 精确匹配 19:25~19:35 那条（涉路施工监管在 K164+000M 还有 13:48~14:48 一条，须区分）
         val e = r.events.first {
             it.location == "K164+000M" && it.eventType == "涉路施工监管" && t(it.startTimeMs!!) == LocalTime.of(19, 25)
         }
@@ -239,9 +235,9 @@ class LogParserEngineSampleTest {
 """.trimIndent()
         val r = LogParserEngine.parse(text, LocalDate.of(2026, 9, 3), zone)
         val locs = r.events.map { it.location }
-        assertTrue(locs.contains("K12+300（上行）"), "方向在后：$locs")
-        assertTrue(locs.contains("K12+300（下行）"), "括号方向：$locs")
-        assertTrue(locs.contains("K13+500（上行）"), "方向在前：$locs")
+        assertTrue(locs.contains("上行K12+300"), "方向在后：$locs")
+        assertTrue(locs.contains("下行K12+300"), "括号方向：$locs")
+        assertTrue(locs.contains("上行K13+500"), "方向在前：$locs")
     }
 
 }

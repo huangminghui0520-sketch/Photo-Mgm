@@ -1,6 +1,4 @@
 // algorithm/LogParserDirSampleTest.kt —— 新样本（方向在前）端到端验收测试
-// 用户新增：桩号需要包含方向（上行/下行/左幅/右幅/上行线/下行线，方向在桩号前）
-// 89 条带方向输入 → 88 条事件；所有含方向桩号的地点在解析后统一带方向
 package algorithm
 
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -12,7 +10,6 @@ import java.time.ZoneId
 class LogParserDirSampleTest {
     private val zone = ZoneId.of("Asia/Shanghai")
 
-    // 新样本第二段（方向在前：上行K..+.. / 下行K..+.. / 左幅K..+.. / 右幅K..+..）
     private val DIR_SAMPLE = """
 上午8点 与早班巡查人员张某某、李某某在A收费管理中心进行交接班，检查巡查装备齐全完好，车况正常，开启粤E00001车载视频监控，视频清晰，已报监控中心。记录人：王某某。
 08时00分 与早班巡查人员张某某、李某某在A收费管理中心进行交接班，检查巡查装备齐全完好，车况正常，开启粤E00001车载视频监控，视频清晰，已报监控中心。记录人：王某某。
@@ -109,7 +106,7 @@ class LogParserDirSampleTest {
 
     @Test fun `带方向样本解析出88条事件且无跳过`() {
         val r = parse()
-        assertEquals(88, r.events.size, "89 行输入去重 1 条（上午8点/08时00分）→ 88 条事件")
+        assertEquals(88, r.events.size, "89 行输入去重 1 条 → 88 条事件")
         assertTrue(r.skippedLines.isEmpty(), "skipped=${r.skippedLines}")
     }
 
@@ -118,18 +115,18 @@ class LogParserDirSampleTest {
         val dirRe = Regex("(上行线|下行线|上行|下行|左幅|右幅)")
         val stakeRe = Regex("K\\d{1,3}[+.]\\d{1,3}(?:M|米)?")
         r.events.forEach { e ->
-            val sm = stakeRe.find(e.description) ?: return@forEach   // 非桩号事件跳过
+            val sm = stakeRe.find(e.description) ?: return@forEach
             val stake = sm.value
             val dirInDesc = dirRe.find(e.description)?.value
             if (dirInDesc != null) {
                 assertTrue(
-                    e.location == "$stake（$dirInDesc）",
-                    "desc 含方向[$dirInDesc]，地点应为 [$stake（$dirInDesc）]，实际=${e.location} | ${e.description.take(40)}"
+                    e.location == "$dirInDesc$stake",
+                    "desc 含方向[$dirInDesc]，地点应为 [$dirInDesc$stake]，实际=${e.location} | ${e.description.take(40)}"
                 )
             } else {
                 assertTrue(
-                    e.location.startsWith(stake),
-                    "desc 无方向，地点应以桩号开头，实际=${e.location} | ${e.description.take(40)}"
+                    e.location.contains(stake),
+                    "desc 无方向，地点应包含桩号，实际=${e.location} | ${e.description.take(40)}"
                 )
             }
         }
@@ -137,25 +134,25 @@ class LogParserDirSampleTest {
 
     @Test fun `抽查关键方向映射`() {
         val r = parse()
-        fun loc(stake: String) = r.events.filter { it.location.startsWith(stake) }.map { it.location }.distinct()
-        assertTrue(loc("K138+700M").contains("K138+700M（上行）"), "到达上行K138+700M")
-        assertTrue(loc("K138+800M").contains("K138+800M（下行）"), "在下行K138+800M")
-        assertTrue(loc("K139+100M").contains("K139+100M（左幅）"), "左幅K139+100M")
-        assertTrue(loc("K139+300M").contains("K139+300M（右幅）"), "右幅K139+300M")
-        assertTrue(loc("K139+500M").contains("K139+500M（上行）"), "上行K139+500M")
-        assertTrue(loc("K139+700M").contains("K139+700M（下行）"), "下行K139+700M")
-        assertTrue(loc("K142+300M").contains("K142+300M（左幅）"), "左幅K142+300M")
-        assertTrue(loc("K100+000M").contains("K100+000M（上行）"), "上行K100+000M")
-        assertTrue(loc("K101+000M").contains("K101+000M（下行）"), "下行K101+000M")
-        assertTrue(loc("K102+000M").contains("K102+000M（左幅）"), "左幅K102+000M")
-        assertTrue(loc("K103+000M").contains("K103+000M（右幅）"), "右幅K103+000M")
-        assertTrue(loc("K210+000M").contains("K210+000M（下行）"), "下行K210+000M")
+        fun loc(stake: String) = r.events.filter { it.location.contains(stake) }.map { it.location }.distinct()
+        assertTrue(loc("K138+700M").contains("上行K138+700M"), "到达上行K138+700M")
+        assertTrue(loc("K138+800M").contains("下行K138+800M"), "在下行K138+800M")
+        assertTrue(loc("K139+100M").contains("左幅K139+100M"), "左幅K139+100M")
+        assertTrue(loc("K139+300M").contains("右幅K139+300M"), "右幅K139+300M")
+        assertTrue(loc("K139+500M").contains("上行K139+500M"), "上行K139+500M")
+        assertTrue(loc("K139+700M").contains("下行K139+700M"), "下行K139+700M")
+        assertTrue(loc("K142+300M").contains("左幅K142+300M"), "左幅K142+300M")
+        assertTrue(loc("K100+000M").contains("上行K100+000M"), "上行K100+000M")
+        assertTrue(loc("K101+000M").contains("下行K101+000M"), "下行K101+000M")
+        assertTrue(loc("K102+000M").contains("左幅K102+000M"), "左幅K102+000M")
+        assertTrue(loc("K103+000M").contains("右幅K103+000M"), "右幅K103+000M")
+        assertTrue(loc("K210+000M").contains("下行K210+000M"), "下行K210+000M")
     }
 
     @Test fun `时间段双桩号取首个带方向`() {
         val r = parse()
         val e = r.events.first { it.description.contains("K164+000M至下行K166+000M") }
-        assertEquals("K164+000M（下行）", e.location)
+        assertEquals("下行K164+000M", e.location)
         assertEquals("涉路施工监管", e.eventType)
         assertEquals(2, e.timePoints.size)
     }
