@@ -7,6 +7,11 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+# 同一分支/标签只保留最新构建，自动取消旧的运行中任务，避免重复构建浪费资源
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build release APK
