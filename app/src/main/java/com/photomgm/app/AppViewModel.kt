@@ -398,7 +398,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(exportProgress = 0f) }
         try {
             val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
-            val fileName = "照片分类_${s.date.format(BASIC_DATE)}.zip"
+            // ★ ZIP 文件名：导出时刻 export_yyyyMMdd_HHmmss.zip
+            val fileName = "export_" + java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".zip"
             // ★ 断点续传状态文件与输出位置解耦（放 app 私有 files 目录），避免输出目录切换丢失
             val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
             val tmpZip = File(getApp().cacheDir, fileName)
