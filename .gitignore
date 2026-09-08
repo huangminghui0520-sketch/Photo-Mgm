@@ -1,0 +1,29 @@
+# Gradle / Android
+.gradle/
+build/
+local.properties
+captures/
+*.apk
+*.aab
+*.zip
+*.xlsx
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试与开发辅助（不入库）
+test_photos/
+test_photos_v2/
+gps_test_photos/
+gps_test_photos_valid/
+shots/
+*.py
+
+# 签名密钥（本地，绝不入库）
+keystore/
