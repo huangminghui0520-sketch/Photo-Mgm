@@ -24,7 +24,7 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
      * @param eventPhotoMap 已合并人工移动后的 eventId -> photoIds（app 侧 effectiveMap）
      * @param unmatched     未匹配照片 id（§7.4 → 「未分类」）
      * @param photoById     照片解析（Android=物理路径 data 层；PC=文件列表）
-     * @param namingTemplate 0=事件类型（默认）｜1=日期+巡查日志内容（§7.4）
+     * @param namingTemplate 0=事件类型｜1=月日+巡查日志内容（§7.4）
      * @param outFile       ZIP 输出文件
      * @param stateFile     断点续传状态（上次全部完成后跳过）
      * @param extraFiles    ZIP 内路径 -> 字节（如台账 Excel）；非空时整包跳过失效（保证内容最新）
@@ -123,19 +123,26 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
 
     /**
      * 事件分类文件夹名（§7.4）。
-     * 模板 1 = 日期 + 巡查日志内容（描述截断 50 字符，换行合并为空格）。
+     * 模板 1 = 月日 + 巡查日志内容（描述去开头时间、截断 50 字符、换行合并为空格）。
+     * 例：0908_巡查至北行K123+000M处发现护栏损坏
      */
     fun folderName(e: LogEvent, namingTemplate: Int): String {
         return if (namingTemplate == 1) {
             val parts = mutableListOf<String>()
             e.startTimeMs?.let { ms ->
-                parts += Instant.ofEpochMilli(ms).atZone(zone).toLocalDate().format(BASIC_DATE)
+                parts += Instant.ofEpochMilli(ms).atZone(zone).toLocalDate().format(MONTH_DAY)
             }
-            if (e.description.isNotBlank()) parts += truncate(e.description, 50)
+            if (e.description.isNotBlank()) parts += truncate(stripLeadingTime(e.description), 50)
             sanitize(parts.joinToString("_"))
         } else {
             sanitize(e.eventType)
         }
+    }
+
+    /** 去除描述开头的时间前缀（"8时30分 "、"08:00 "、"上午8点 "、"13时48分至14时48分 "等）。 */
+    private fun stripLeadingTime(s: String): String {
+        val m = LEADING_TIME_RE.matchAt(s, 0)
+        return if (m != null) s.substring(m.range.last + 1).trimStart() else s
     }
 
     /** 描述单行化 + 截断（保留语义，避免文件夹名过长）。 */
@@ -163,5 +170,8 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
 
     private companion object {
         val BASIC_DATE: DateTimeFormatter = DateTimeFormatter.BASIC_ISO_DATE
+        val MONTH_DAY: DateTimeFormatter = DateTimeFormatter.ofPattern("MMdd")
+        /** 开头时间前缀：上午/下午可选 + 时点 + 可选"至终点" + 尾随空格 */
+        val LEADING_TIME_RE = Regex("""^(?:上午|下午)?\d{1,2}[点时:：]\d{0,2}(?:分)?(?:至\d{1,2}[点时:：]\d{0,2}(?:分)?)?\s*""")
     }
 }

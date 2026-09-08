@@ -59,13 +59,13 @@ class ZipExporterTest {
         assertTrue("交安设施巡查/b.jpg" in names)
     }
 
-    @Test fun `模板二=日期+日志内容`() {
+    @Test fun `模板二=月日+日志内容`() {
         val (p1, _) = makePhoto(1, "a.jpg", "AAA")
         val e = ev(1, at(8, 30), at(10, 0))
         val zip = File(tmp, "out2.zip")
         ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 1, zip, null) { _, _ -> }
-        assertEquals(listOf("20260903_描述1/a.jpg"), zipNames(zip))
+        assertEquals(listOf("0903_描述1/a.jpg"), zipNames(zip))
     }
 
     @Test fun `模板二日志内容截断与换行合并`() {
@@ -76,9 +76,24 @@ class ZipExporterTest {
         val zip = File(tmp, "out3.zip")
         ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 1, zip, null) { _, _ -> }
-        // 换行合并为空格；描述 23 字符 < 50 上限，不截断
+        // 换行合并为空格；描述 23 字符 < 50 上限，不截断；月日格式
         assertEquals(
-            "20260903_发现路面障碍物并已清理 现场通知养护单位跟进处理/a.jpg",
+            "0903_发现路面障碍物并已清理 现场通知养护单位跟进处理/a.jpg",
+            zipNames(zip).first()
+        )
+    }
+
+    @Test fun `模板二去除开头时间前缀`() {
+        val (p1, _) = makePhoto(1, "a.jpg", "AAA")
+        val e = ev(1, at(8, 30), at(10, 0)).copy(
+            description = "8时30分 到达上行K138+700M处，检查交安设施"
+        )
+        val zip = File(tmp, "outTime.zip")
+        ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
+            { p1 }, 1, zip, null) { _, _ -> }
+        // 开头 "8时30分 " 被去除
+        assertEquals(
+            "0903_到达上行K138+700M处，检查交安设施/a.jpg",
             zipNames(zip).first()
         )
     }
@@ -88,15 +103,15 @@ class ZipExporterTest {
         val e = ev(1, at(8, 30), at(10, 0))
         val zip = File(tmp, "outExtra.zip")
         val state = File(tmp, "export_state_extra.json")
-        val extra = mapOf("巡查台账_20260903_083000.xlsx" to "XLSX-BYTES-123".toByteArray())
+        val extra = mapOf("20260903.xlsx" to "XLSX-BYTES-123".toByteArray())
         // 首次：照片 + Excel 都写入
         val r1 = ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 0, zip, state, extraFiles = extra) { _, _ -> }
         assertEquals(2, r1.copied)
         val names = zipNames(zip)
         assertTrue("交安设施巡查/a.jpg" in names)
-        assertTrue("巡查台账_20260903_083000.xlsx" in names)
-        assertEquals("XLSX-BYTES-123", zipContent(zip, "巡查台账_20260903_083000.xlsx"))
+        assertTrue("20260903.xlsx" in names)
+        assertEquals("XLSX-BYTES-123", zipContent(zip, "20260903.xlsx"))
         // 再次导出（带 extraFiles）：不得整包跳过（保证台账最新）
         val r2 = ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 0, zip, state, extraFiles = extra) { _, _ -> }
