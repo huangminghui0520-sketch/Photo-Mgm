@@ -50,40 +50,40 @@ class LocationExtractorTest {
         assertNull(LocationExtractor.extract("巡查人员张某某、李某某对全线进行巡查，路况正常"))
     }
 
-    // ---------- 方向兼容（§3.2 增强：桩号+方向） ----------
+    // ---------- 方向兼容（§3.2 增强：桩号+方向，方向前置） ----------
 
     @Test fun `方向在后 空格分隔`() {
-        assertEquals("K12+300（上行）", LocationExtractor.extract("巡查至K12+300 上行，发现路面障碍物"))
+        assertEquals("上行K12+300", LocationExtractor.extract("巡查至K12+300 上行，发现路面障碍物"))
     }
 
     @Test fun `方向在后 无空格`() {
-        assertEquals("K12+300（下行）", LocationExtractor.extract("到达K12+300下行处，处置抛洒物"))
+        assertEquals("下行K12+300", LocationExtractor.extract("到达K12+300下行处，处置抛洒物"))
     }
 
     @Test fun `方向在前 空格分隔`() {
-        assertEquals("K12+300（上行）", LocationExtractor.extract("上行 K12+300 路段发生交通事故"))
+        assertEquals("上行K12+300", LocationExtractor.extract("上行 K12+300 路段发生交通事故"))
     }
 
     @Test fun `方向在前 无空格`() {
-        assertEquals("K12+300（下行）", LocationExtractor.extract("下行K12+300 处标志牌倾斜"))
+        assertEquals("下行K12+300", LocationExtractor.extract("下行K12+300 处标志牌倾斜"))
     }
 
     @Test fun `括号方向`() {
-        assertEquals("K12+300（上行）", LocationExtractor.extract("接报K12+300（上行）处护栏损坏"))
+        assertEquals("上行K12+300", LocationExtractor.extract("接报K12+300（上行）处护栏损坏"))
     }
 
     @Test fun `左幅右幅`() {
-        assertEquals("K12+300（左幅）", LocationExtractor.extract("K12+300 左幅 发现坑槽"))
-        assertEquals("K12+300（右幅）", LocationExtractor.extract("右幅K12+300 施工中"))
+        assertEquals("左幅K12+300", LocationExtractor.extract("K12+300 左幅 发现坑槽"))
+        assertEquals("右幅K12+300", LocationExtractor.extract("右幅K12+300 施工中"))
     }
 
     @Test fun `上行线下行线`() {
-        assertEquals("K12+300（上行线）", LocationExtractor.extract("K12+300 上行线 车流正常"))
-        assertEquals("K12+300（下行线）", LocationExtractor.extract("下行线 K12+300 施工"))
+        assertEquals("上行线K12+300", LocationExtractor.extract("K12+300 上行线 车流正常"))
+        assertEquals("下行线K12+300", LocationExtractor.extract("下行线 K12+300 施工"))
     }
 
     @Test fun `带方向不带M桩号`() {
-        assertEquals("K120+500（上行）", LocationExtractor.extract("巡查至K120+500 上行"))
+        assertEquals("上行K120+500", LocationExtractor.extract("巡查至K120+500 上行"))
     }
 
     @Test fun `无方向桩号 保持原样`() {
@@ -97,49 +97,49 @@ class LocationExtractorTest {
     // ---------- 新样本（收费公路巡查日志 v2）新增变体 ----------
 
     @Test fun `前方方向 带M单位 处`() {
-        assertEquals("K138+700M（上行）", LocationExtractor.extract("到达上行K138+700M处，检查交安设施"))
+        assertEquals("上行K138+700M", LocationExtractor.extract("到达上行K138+700M处，检查交安设施"))
     }
 
     @Test fun `前方方向 左幅 带M单位`() {
-        assertEquals("K139+100M（左幅）", LocationExtractor.extract("巡查至左幅K139+100M处，发现路面有轮胎皮"))
+        assertEquals("左幅K139+100M", LocationExtractor.extract("巡查至左幅K139+100M处，发现路面有轮胎皮"))
     }
 
     @Test fun `双桩号区间 取首个带方向`() {
-        assertEquals("K164+000M（下行）", LocationExtractor.extract("在下行K164+000M至下行K166+000M路段进行涉路施工监管"))
+        assertEquals("下行K164+000M", LocationExtractor.extract("在下行K164+000M至下行K166+000M路段进行涉路施工监管"))
     }
 
     @Test fun `前方方向 带处 调头行`() {
-        assertEquals("K145+000M（上行）", LocationExtractor.extract("在上行K145+000M处调头往北行方向巡查"))
+        assertEquals("上行K145+000M", LocationExtractor.extract("在上行K145+000M处调头往北行方向巡查"))
     }
 
     @Test fun `前方方向 施工点`() {
-        assertEquals("K164+000M（下行）", LocationExtractor.extract("到达下行K164+000M施工点，检查基坑施工"))
+        assertEquals("下行K164+000M", LocationExtractor.extract("到达下行K164+000M施工点，检查基坑施工"))
     }
 
     @Test fun `括号内上行线`() {
-        assertEquals("K12+300（上行线）", LocationExtractor.extract("K12+300（上行线） 护栏损坏"))
+        assertEquals("上行线K12+300", LocationExtractor.extract("K12+300（上行线） 护栏损坏"))
     }
 
     @Test fun `前方方向 通信机房`() {
-        assertEquals("K165+000M（下行）", LocationExtractor.extract("到达下行K165+000M处通信机房，检查设备运行正常"))
+        assertEquals("下行K165+000M", LocationExtractor.extract("到达下行K165+000M处通信机房，检查设备运行正常"))
     }
 
     // ---------- 方位方向（北/南/东/西行） ----------
 
     @Test fun `北行前方方向`() {
-        assertEquals("K123+000M（北行）", LocationExtractor.extract("北行K123+000M处发现路面有坑槽"))
+        assertEquals("北行K123+000M", LocationExtractor.extract("北行K123+000M处发现路面有坑槽"))
     }
 
     @Test fun `南行后方方向`() {
-        assertEquals("K123+000M（南行）", LocationExtractor.extract("到达K123+000M 南行，处置抛洒物"))
+        assertEquals("南行K123+000M", LocationExtractor.extract("到达K123+000M 南行，处置抛洒物"))
     }
 
     @Test fun `东行前方方向 带M`() {
-        assertEquals("K456+000M（东行）", LocationExtractor.extract("巡查至东行K456+000M处，路况正常"))
+        assertEquals("东行K456+000M", LocationExtractor.extract("巡查至东行K456+000M处，路况正常"))
     }
 
     @Test fun `西行无空格后方方向`() {
-        assertEquals("K123+000M（西行）", LocationExtractor.extract("在K123+000M西行处检查护栏"))
+        assertEquals("西行K123+000M", LocationExtractor.extract("在K123+000M西行处检查护栏"))
     }
 
     @Test fun `方位方向词但无桩号 不误抓`() {

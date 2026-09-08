@@ -59,13 +59,13 @@ class ZipExporterTest {
         assertTrue("交安设施巡查/b.jpg" in names)
     }
 
-    @Test fun `模板二=日期+事件类型+日志内容`() {
+    @Test fun `模板二=日期+日志内容`() {
         val (p1, _) = makePhoto(1, "a.jpg", "AAA")
         val e = ev(1, at(8, 30), at(10, 0))
         val zip = File(tmp, "out2.zip")
         ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 1, zip, null) { _, _ -> }
-        assertEquals(listOf("20260903_交安设施巡查_描述1/a.jpg"), zipNames(zip))
+        assertEquals(listOf("20260903_描述1/a.jpg"), zipNames(zip))
     }
 
     @Test fun `模板二日志内容截断与换行合并`() {
@@ -76,9 +76,9 @@ class ZipExporterTest {
         val zip = File(tmp, "out3.zip")
         ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
             { p1 }, 1, zip, null) { _, _ -> }
-        // 换行合并为空格；本描述恰好 24 字符（11+空格+12），不截断
+        // 换行合并为空格；描述 23 字符 < 50 上限，不截断
         assertEquals(
-            "20260903_交安设施巡查_发现路面障碍物并已清理 现场通知养护单位跟进处理/a.jpg",
+            "20260903_发现路面障碍物并已清理 现场通知养护单位跟进处理/a.jpg",
             zipNames(zip).first()
         )
     }

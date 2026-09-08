@@ -34,7 +34,7 @@ object LocationExtractor {
         """(?:($dirRe)\s*)?(K\d{1,3}[+.]\d{1,3}(?:M|米)?)(?:\s*[（(]\s*($dirRe)\s*[)）])?(?:\s*($dirRe))?""")
 
     fun extract(text: String): String? {
-        // ① 桩号 + 方向（优先于切分）：整体匹配，方向标准化合并 → "K12+300（上行）"
+        // ① 桩号 + 方向（优先于切分）：整体匹配，方向前置 → "上行K12+300"
         stakeWithDir(text)?.let { return it }
         // ② 非桩号地点：切分片段内匹配（原逻辑；方向缺失/无关时保持原样）
         for (seg in splitRe.split(text)) {
@@ -44,13 +44,14 @@ object LocationExtractor {
     }
 
     /**
-     * 匹配桩号并合并方向（方向标准化为「方向」括注；无方向返回桩号本体）。
+     * 匹配桩号并合并方向（方向前置；无方向返回桩号本体）。
      * 方向优先级：括号方向 > 前方方向 > 后方方向（如"上行 K12+300（下行）"取下行）。
      */
     private fun stakeWithDir(text: String): String? {
         val m = stakeRe.find(text) ?: return null
         val stake = m.groupValues[2]
         val dir = m.groupValues[3].ifBlank { m.groupValues[1].ifBlank { m.groupValues[4] } }
-        return if (dir.isBlank()) stake else "$stake（$dir）"
+        // ★ 方向前置：北行K123+000M（不再用括号包裹）
+        return if (dir.isBlank()) stake else "$dir$stake"
     }
 }

@@ -24,7 +24,7 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
      * @param eventPhotoMap 已合并人工移动后的 eventId -> photoIds（app 侧 effectiveMap）
      * @param unmatched     未匹配照片 id（§7.4 → 「未分类」）
      * @param photoById     照片解析（Android=物理路径 data 层；PC=文件列表）
-     * @param namingTemplate 0=事件类型（默认）｜1=日期+事件类型+巡查日志内容（§7.4）
+     * @param namingTemplate 0=事件类型（默认）｜1=日期+巡查日志内容（§7.4）
      * @param outFile       ZIP 输出文件
      * @param stateFile     断点续传状态（上次全部完成后跳过）
      * @param extraFiles    ZIP 内路径 -> 字节（如台账 Excel）；非空时整包跳过失效（保证内容最新）
@@ -123,7 +123,7 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
 
     /**
      * 事件分类文件夹名（§7.4）。
-     * 模板 1 = 日期 + 事件类型 + 巡查日志内容（描述截断 24 字符，换行合并为空格）。
+     * 模板 1 = 日期 + 巡查日志内容（描述截断 50 字符，换行合并为空格）。
      */
     fun folderName(e: LogEvent, namingTemplate: Int): String {
         return if (namingTemplate == 1) {
@@ -131,8 +131,7 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
             e.startTimeMs?.let { ms ->
                 parts += Instant.ofEpochMilli(ms).atZone(zone).toLocalDate().format(BASIC_DATE)
             }
-            if (e.eventType.isNotBlank()) parts += e.eventType
-            if (e.description.isNotBlank()) parts += truncate(e.description, 24)
+            if (e.description.isNotBlank()) parts += truncate(e.description, 50)
             sanitize(parts.joinToString("_"))
         } else {
             sanitize(e.eventType)
