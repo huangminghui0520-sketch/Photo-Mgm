@@ -273,8 +273,8 @@ fun SettingsScreen(vm: AppViewModel) {
                 NamingRadio(
                     selected = state.namingTemplate == 1,
                     onClick = { vm.setNamingTemplate(1) },
-                    title = "日期 + 巡查日志内容（最多50字）",
-                    example = "例：20260908_北行K123+000M路面发现抛洒物现场处置",
+                    title = "月日 + 巡查日志内容（最多50字，去开头时间）",
+                    example = "例：0908_巡查至北行K123+000M处发现抛洒物",
                 )
             }
         }

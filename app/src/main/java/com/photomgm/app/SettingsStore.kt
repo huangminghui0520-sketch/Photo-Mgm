@@ -22,7 +22,7 @@ class SettingsStore(context: Context) {
         set(v) = prefs.edit().putString(KEY_OUTPUT, v).apply()
 
     var namingTemplate: Int
-        get() = prefs.getInt(KEY_TEMPLATE, 0)
+        get() = prefs.getInt(KEY_TEMPLATE, 1)
         set(v) = prefs.edit().putInt(KEY_TEMPLATE, v).apply()
 
     var logsText: String
