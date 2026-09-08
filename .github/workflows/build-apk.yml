@@ -1,6 +1,6 @@
 name: Build APK
 
-# 每次推送到 main（或手动触发）自动构建 release APK 并上传为 Artifact
+# 每次推送到 main（或手动触发）自动构建 release APK，构建成功后自动发布 GitHub Release
 on:
   push:
     branches: [ main ]
@@ -10,6 +10,9 @@ jobs:
   build:
     name: Build release APK
     runs-on: ubuntu-latest
+    # 允许创建 tag 与发布 Release 所需的 contents 写权限
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,3 +66,21 @@ jobs:
           name: Photo-Mgm-release-apk
           path: dist/Photo-Mgm-release.apk
           if-no-files-found: error
+
+      # 构建成功后自动发布 GitHub Release（预发布版，tag 每次唯一不冲突）
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ github.run_number }}
+          name: Photo-Mgm 自动构建 #${{ github.run_number }}
+          body: |
+            每次推送 main 自动生成的测试安装包。
+            - 构建序号：#${{ github.run_number }}
+            - Commit：`${{ github.sha }}`
+            - 日期：${{ github.event.head_commit.timestamp }}
+            - 说明：此为自动构建（debug 签名），正式签名版请配置 GitHub Secrets 后发布。
+          files: dist/Photo-Mgm-release.apk
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
