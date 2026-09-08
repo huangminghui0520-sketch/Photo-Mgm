@@ -34,7 +34,7 @@ data class UiState(
     val date: LocalDate = LocalDate.now(),
     val sourceDirs: List<String> = emptyList(),
     val outputDir: String? = null,
-    val namingTemplate: Int = 0,          // 0=事件类型，1=日期+事件类型+日志内容
+    val namingTemplate: Int = 1,          // 0=事件类型，1=月日+巡查日志内容（默认1）
     val coarseCount: Int? = null,          // 粗筛「已筛出 N 张」
     val logsText: String = "",
     val parsed: ParsedLog? = null,
@@ -273,7 +273,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- 导出（§7.3 Excel / §7.4 ZIP，经 AlgorithmApi 单向调用核心） ----------
 
-    /** 导出台账 Excel：台账_巡查日期.xlsx（§7.3）。输出目录支持 SAF 树 URI 或本地路径。 */
+    /** 导出台账 Excel：yyyyMMdd.xlsx（§7.3）。输出目录支持 SAF 树 URI 或本地路径。 */
     fun exportLedger() = viewModelScope.launch(Dispatchers.IO) {
         if (state.value.busy) return@launch
         val s = state.value
@@ -290,9 +290,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val prep = prepareLedger(s) { frac -> _state.update { it.copy(exportProgress = frac) } }
                 ?: throw IllegalStateException("台账数据准备失败")
             val (rows, bytesCache, imgDebug) = prep
-            // ★ 文件名：巡查台账_yyyyMMdd_HHmmss.xlsx（导出Excel 2.0 方案）
-            val fileName = "巡查台账_" + java.time.LocalDateTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".xlsx"
+            // ★ 文件名：yyyyMMdd.xlsx
+            val fileName = java.time.LocalDate.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")) + ".xlsx"
             val (os, shown) = openOutputSink(fileName)
             if (os == null) { _state.update { it.copy(exportMessage = "导出失败：无法写入输出目录", exportProgress = null) }; return@launch }
             _state.update { it.copy(exportProgress = 0.85f) }
@@ -398,8 +398,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(exportProgress = 0f) }
         try {
             val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
-            // ★ ZIP 文件名：导出时刻 export_yyyyMMdd_HHmmss.zip
-            val fileName = "export_" + java.time.LocalDateTime.now()
+            // ★ ZIP 文件名：导出时刻 yyyyMMdd_HHmmss.zip
+            val fileName = java.time.LocalDateTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".zip"
             // ★ 断点续传状态文件与输出位置解耦（放 app 私有 files 目录），避免输出目录切换丢失
             val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
@@ -412,8 +412,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { AlgorithmApi.exportLedgerXlsx(rows, bos) { ref -> cache[ref] } }
                     .getOrNull()?.let { bos.toByteArray() }
             }
-            val xlsxName = "巡查台账_" + java.time.LocalDateTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".xlsx"
+            val xlsxName = java.time.LocalDate.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")) + ".xlsx"
             val extraFiles = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) mapOf(xlsxName to xlsxBytes) else emptyMap()
 
             val r = AlgorithmApi.exportZip(parsed.events, effectiveMap(c), effectiveUnmatched(c),
