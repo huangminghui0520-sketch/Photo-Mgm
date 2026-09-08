@@ -1,0 +1,65 @@
+name: Build APK
+
+# 每次推送到 main（或手动触发）自动构建 release APK 并上传为 Artifact
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 项目国内镜像已写入 settings.gradle.kts（阿里云），Actions 环境直连亦可
+      # 安装 Gradle 8.10.2（与 gradle-wrapper.properties 一致），绕过仓库内无 wrapper jar 的问题
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      # 正式签名：若配置了 GitHub Secrets（KEYSTORE_BASE64 等）则注入签名；
+      # 未配置时 build.gradle.kts 自动回退 debug 签名（可安装使用，非正式签名）
+      - name: Configure release signing
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            mkdir -p keystore
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore/photomgm-release.jks
+            cat > keystore/keystore.properties <<EOF
+            storeFile=keystore/photomgm-release.jks
+            storePassword=${{ secrets.KEYSTORE_STORE_PASSWORD }}
+            keyAlias=${{ secrets.KEYSTORE_KEY_ALIAS }}
+            keyPassword=${{ secrets.KEYSTORE_KEY_PASSWORD }}
+            EOF
+            echo "正式签名已注入（keystore.properties 已生成）"
+          else
+            echo "未配置 KEYSTORE_BASE64 → release 将回退 debug 签名（功能完整可安装）"
+          fi
+
+      - name: Build release APK
+        run: gradle :app:assembleRelease --no-daemon
+
+      # AGP 8.7.3 公共 API 不支持配置 APK 输出名，构建产物为 app-release.apk；
+      # 上传前重命名为 Photo-Mgm-release.apk
+      - name: Rename APK
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/Photo-Mgm-release.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Photo-Mgm-release-apk
+          path: dist/Photo-Mgm-release.apk
+          if-no-files-found: error
