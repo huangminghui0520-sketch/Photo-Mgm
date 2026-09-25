@@ -287,7 +287,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(exportProgress = 0.05f, exportMessage = null, lastExport = null) }
         try {
             // ★ 台账内容准备（buildLedger + 图片预收集），与 ZIP 导出共用同一逻辑
-            val prep = prepareLedger(s) { frac -> _state.update { it.copy(exportProgress = frac) } }
+            val prep = prepareLedger(s, effectiveMap(c)) { frac -> _state.update { it.copy(exportProgress = frac) } }
                 ?: throw IllegalStateException("台账数据准备失败")
             val (rows, bytesCache, imgDebug) = prep
             // ★ 文件名：yyyyMMdd.xlsx
@@ -312,15 +312,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 台账内容准备（§7.3，导出 Excel / ZIP 共用）：
      * buildLedger → 收集照片字节（4:3 裁剪 400px JPEG50）→ 返回 (rows, 图片字节缓存, 调试统计)。
      * 失败返回 null。
+     * @param eventPhotoMap 打包前一刻的最终分类快照（台账与 ZIP 共用，保证照片一致）
      * @param onProgress 图片预收集进度回调（0.1..0.7 区间）
      */
     private fun prepareLedger(
         s: UiState,
+        eventPhotoMap: Map<Int, List<Long>>,
         onProgress: (Float) -> Unit = {},
     ): Triple<List<LedgerRow>, Map<String, ByteArray?>, String>? {
         return try {
             val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
-            val rows = AlgorithmApi.buildLedger(s.parsed!!.events, effectiveMap(s.classify!!), photoById)
+            val rows = AlgorithmApi.buildLedger(s.parsed!!.events, eventPhotoMap, photoById)
             // ★ 分区存储：sourceRef 是 MediaStore DATA 物理路径，Android 10+ 无法直接 decodeFile，
             //   用 Photo.id 构造 content://media/... URI 读取（App 有 READ_MEDIA_IMAGES 权限）。
             val ctx = getApp()
@@ -398,6 +400,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(exportProgress = 0f) }
         try {
             val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
+            // ★ 打包前一刻计算最终分类快照（合并人工移动/移除），台账与打包共用同一份，保证照片一致
+            val finalMap = effectiveMap(c)
+            val finalUnmatched = effectiveUnmatched(c)
             // ★ ZIP 文件名：导出时刻 yyyyMMdd_HHmmss.zip
             val fileName = java.time.LocalDateTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".zip"
@@ -405,8 +410,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
             val tmpZip = File(getApp().cacheDir, fileName)
 
-            // ★ 台账 Excel 准备（与 exportLedger 同一逻辑），打包进 ZIP 根目录
-            val prep = prepareLedger(s) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
+            // ★ 台账 Excel 准备（用同一个 finalMap，保证台账照片 = 实际打包的照片）
+            val prep = prepareLedger(s, finalMap) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
             val xlsxBytes = prep?.let { (rows, cache, _) ->
                 val bos = ByteArrayOutputStream()
                 runCatching { AlgorithmApi.exportLedgerXlsx(rows, bos) { ref -> cache[ref] } }
@@ -416,7 +421,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")) + ".xlsx"
             val extraFiles = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) mapOf(xlsxName to xlsxBytes) else emptyMap()
 
-            val r = AlgorithmApi.exportZip(parsed.events, effectiveMap(c), effectiveUnmatched(c),
+            val r = AlgorithmApi.exportZip(parsed.events, finalMap, finalUnmatched,
                 photoById, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles) { frac, _ ->
                 _state.update { it.copy(exportProgress = 0.6f + 0.4f * frac) }
             }

@@ -1,6 +1,6 @@
 // algorithm/XlsxWriter.kt —— §7.3 Excel 写入（纯 Kotlin，零第三方依赖，可移植 PC）
 // ★ 导出Excel 2.0 方案：6 列（序号/日期/地点/日志内容/照片1/照片2），列宽 A8 B18 C24 D60 E20 F20，
-//   表头行高 25、数据行高 81，日志内容列自动换行，照片以 4:3 缩略图嵌入（调用方裁剪好字节）。
+//   表头行高 25、数据行高动态（随日志内容长度），日志内容列自动换行，照片以缩略图嵌入。
 // ★ 照片嵌入：imageLoader(ref) 返回图片字节（JPEG/PNG），自动生成 drawing + media + rels；
 //   图片锚定到照片1/照片2 所在单元格（E/F 列 × 1 行显示区）。无图片或加载失败 → 照片列仅写文件名。
 package algorithm
@@ -17,9 +17,23 @@ object XlsxWriter {
     /** 列宽（字符）：A:8, B:18, C:24, D:60, E:20, F:20 */
     private val COL_WIDTHS: List<Int> = listOf(8, 18, 24, 60, 20, 20)
 
-    /** 表头行高 / 数据行高（磅） */
+    /** 表头行高 / 数据行最小行高（磅）。数据行高随日志内容动态计算，避免长文本撑高行导致照片错位。 */
     private const val HEADER_ROW_H = 25
-    private const val DATA_ROW_H = 81
+    private const val DATA_ROW_H_MIN = 81
+
+    /** D列（日志内容）列宽 60 字符；估算每行可容纳约 30 个中文字符（11pt 字体）。 */
+    private const val CHARS_PER_LINE = 30
+    /** 每行文本约 16 磅 + 上下边距 8 磅。 */
+    private const val LINE_HEIGHT_PT = 16
+    private const val TEXT_PADDING_PT = 8
+
+    /** 根据日志内容长度动态计算行高：至少容纳照片(81磅)，长文本按行数增加，避免 Excel 自动撑高导致照片错位。 */
+    private fun calcRowHeight(description: String?): Int {
+        if (description.isNullOrBlank()) return DATA_ROW_H_MIN
+        val lines = (description.length + CHARS_PER_LINE - 1) / CHARS_PER_LINE
+        val textHeight = lines * LINE_HEIGHT_PT + TEXT_PADDING_PT
+        return maxOf(DATA_ROW_H_MIN, textHeight)
+    }
 
     /** 图片锚定：照片1 列=4、照片2 列=5（0-based E/F）；显示 1 列 × 1 行。 */
     private const val COL_P1 = 4
@@ -104,6 +118,7 @@ object XlsxWriter {
         sb.append("<sheetData>")
         sb.append(headerRowXml())
         rows.forEachIndexed { i, r ->
+            val rowH = calcRowHeight(r.description)
             sb.append(dataRowXml(i + 2, listOf(
                 (i + 1).toString(),          // 序号（程序生成）
                 r.dateTime,
@@ -111,7 +126,7 @@ object XlsxWriter {
                 r.description,
                 fileName(r.photo1Ref),
                 fileName(r.photo2Ref),
-            )))
+            ), rowH))
         }
         sb.append("</sheetData>")
         if (hasDrawing) sb.append("""<drawing r:id="rIdDraw1"/>""")
@@ -130,9 +145,9 @@ object XlsxWriter {
         return sb.toString()
     }
 
-    /** 数据行：行高 81 磅；日志内容列（D，索引 3）应用 wrapText 样式（s="1"）。 */
-    private fun dataRowXml(r: Int, cells: List<String?>): String {
-        val sb = StringBuilder("""<row r="$r" ht="$DATA_ROW_H" customHeight="1">""")
+    /** 数据行：行高动态计算（随日志内容长度）；日志内容列（D，索引 3）应用 wrapText 样式（s="1"）。 */
+    private fun dataRowXml(r: Int, cells: List<String?>, rowHeight: Int): String {
+        val sb = StringBuilder("""<row r="$r" ht="$rowHeight" customHeight="1">""")
         cells.forEachIndexed { i, c ->
             val col = ('A' + i)
             val style = if (i == 3) """ s="1""" else ""
