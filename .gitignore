@@ -27,3 +27,7 @@ shots/
 
 # 签名密钥（本地，绝不入库）
 keystore/
+
+# Gradle wrapper jar（本地下载，不入库）
+gradle/wrapper/gradle-wrapper.jar
+.kotlin/

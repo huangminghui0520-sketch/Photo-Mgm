@@ -20,9 +20,9 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Photo-Mgm"
-// :algorithm = 核心算法模块（纯 Kotlin JVM，零 Android 依赖，可移植 PC）
+// :algorithm = 核心算法模块（纯 Kotlin JVM，零平台依赖，Android/PC 共用）
 include(":algorithm")
-// :data = Android 数据接入层（MediaStore / SAF / ExifInterface；依赖 :algorithm，仅做平台实现）
+// :data = 桌面数据接入层（文件系统扫描 / metadata-extractor EXIF / 缓存；依赖 :algorithm，仅做平台实现）
 include(":data")
-// :app = Android UI（Compose 三段式；仅经 AlgorithmApi 单向调用核心）
-include(":app")
+// :desktop = PC 桌面 UI（Compose Desktop 双栏工作台；仅经 AlgorithmApi 单向调用核心）
+include(":desktop")
