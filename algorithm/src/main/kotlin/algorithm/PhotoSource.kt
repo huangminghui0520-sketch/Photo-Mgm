@@ -24,6 +24,15 @@ interface ExifReader {
     fun readCaptureTimeMs(sourceRef: String): Long?
     /** GPS 坐标 → (纬度, 经度)；读不到返回 null。 */
     fun readGps(sourceRef: String): Pair<Double, Double>?
+
+    /**
+     * 合并精读：一次打开资源同时读取 (拍摄时间, GPS)。
+     * 默认实现退化为两次独立读取（兼容旧实现/PC 端实现）；
+     * 平台实现应覆盖本方法以消除重复打开开销（ExifPhotoReader 一次 ExifInterface 构造）。
+     * 语义契约与两个独立方法完全一致：失败字段置 null、互不拖累。
+     */
+    fun readAll(sourceRef: String): Pair<Long?, Pair<Double, Double>?> =
+        readCaptureTimeMs(sourceRef) to readGps(sourceRef)
 }
 
 /**
@@ -79,19 +88,63 @@ object PhotoIngest {
     }
 
     /**
+     * 派生文件去重（2026-10-01 新增）：同一照片存在主图 + 压缩版/原图备份等多份派生文件时，
+     * 按「基名（去掉派生后缀与扩展名）」分组，每组保留最高优先级版本。
+     * 优先级：主图（无派生后缀）> _original > _compressed > 其余派生后缀。
+     * 修复场景：9-25 实例 124 个文件 = 62 张主图 + 62 个 _compressed 派生文件，
+     * 派生文件无 EXIF 时间/GPS 全部进「未分类」，且与主图重复。
+     * @return Pair(去重后候选, 合并组数)（合并组数供 UI 提示「已合并 N 组派生文件」）
+     */
+    fun dedupDerived(candidates: List<CandidatePhoto>): Pair<List<CandidatePhoto>, Int> {
+        // 派生后缀：_compressed/_original/_edited/_modified 等（紧跟扩展名之前，可叠加如 _original_compressed）
+        val derivedRe = Regex("""(_(?:compressed|original|edited|modified|optimized|resized|缩略|压缩|原图))+(?=\.[^.]+$)""", RegexOption.IGNORE_CASE)
+
+        /** 基名 = 文件名去掉全部派生后缀与扩展名（_original_compressed 与主图归同一基名）。 */
+        fun baseName(name: String): String {
+            val stem = derivedRe.replace(name, "")
+            val dot = stem.lastIndexOf('.')
+            return if (dot >= 0) stem.substring(0, dot) else stem
+        }
+
+        /** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2 < _original_compressed=3。 */
+        fun score(name: String): Int {
+            val lower = name.lowercase()
+            var s = 0
+            if (lower.contains("_original")) s += 1
+            if (lower.contains("_compressed")) s += 2
+            return s
+        }
+
+        val best = LinkedHashMap<String, CandidatePhoto>()
+        var merged = 0
+        for (c in candidates) {
+            val key = baseName(c.displayName)
+            val prev = best[key]
+            if (prev == null) {
+                best[key] = c
+            } else if (score(c.displayName) < score(prev.displayName)) {
+                best[key] = c; merged++
+            } else {
+                merged++
+            }
+        }
+        return best.values.toList() to merged
+    }
+
+    /**
      * EXIF 精读编排：对粗筛结果逐一精读，组装为 Photo。
      * 读失败字段置 null、不中断（§4.3）。并发优化由 data 层实现，核心保持串行简单可移植。
      */
     fun readExif(candidates: List<CandidatePhoto>, exif: ExifReader): List<Photo> =
         candidates.map { c ->
-            val gps = runCatching { exif.readGps(c.sourceRef) }.getOrNull()
+            val (t, g) = runCatching { exif.readAll(c.sourceRef) }.getOrNull() ?: (null to null)
             Photo(
                 id = c.id,
                 sourceRef = c.sourceRef,
                 displayName = c.displayName,
-                captureTimeMs = runCatching { exif.readCaptureTimeMs(c.sourceRef) }.getOrNull(),
-                latitude = gps?.first,
-                longitude = gps?.second,
+                captureTimeMs = t,
+                latitude = g?.first,
+                longitude = g?.second,
             )
         }
 

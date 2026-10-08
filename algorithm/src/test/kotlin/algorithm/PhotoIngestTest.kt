@@ -162,4 +162,53 @@ class PhotoIngestTest {
         )
         assertEquals(listOf("IMG_20260904_003000.jpg"), out.map { it.displayName })
     }
+
+    // ---- 派生文件基名去重（2026-10-01 新增，修复压缩版无 EXIF 全部落未分类） ----
+
+    @Test fun `派生文件按基名去重保留主图`() {
+        // 9-25 实例实际形态：主图 + _original + _compressed + _original_compressed 四份同源文件
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(2, "a/IMG_20260925_080504148_original.jpg", "IMG_20260925_080504148_original.jpg"),
+            c(3, "a/IMG_20260925_080504148_compressed.jpeg", "IMG_20260925_080504148_compressed.jpeg"),
+            c(4, "a/IMG_20260925_080504148_original_compressed.jpeg", "IMG_20260925_080504148_original_compressed.jpeg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(1, out.size)
+        assertEquals("IMG_20260925_080504148.jpg", out[0].displayName, "保留主图（无派生后缀）")
+        assertEquals(3, merged, "合并组数 = 被去重文件数")
+    }
+
+    @Test fun `无主图时_original优先于_compressed`() {
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148_compressed.jpeg", "IMG_20260925_080504148_compressed.jpeg"),
+            c(2, "a/IMG_20260925_080504148_original.jpg", "IMG_20260925_080504148_original.jpg"),
+        )
+        val (out, _) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(1, out.size)
+        assertEquals("IMG_20260925_080504148_original.jpg", out[0].displayName, "_original 优先于 _compressed")
+    }
+
+    @Test fun `不同基名不合并`() {
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(2, "a/IMG_20260925_080504149.jpg", "IMG_20260925_080504149.jpg"),
+            c(3, "a/IMG_20260925_080504149_compressed.jpeg", "IMG_20260925_080504149_compressed.jpeg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(2, out.size)
+        assertEquals(1, merged)
+        assertEquals("IMG_20260925_080504149.jpg", out[1].displayName, "压缩版被其主图替换")
+    }
+
+    @Test fun `派生后缀大小写不敏感且仅当紧跟扩展名`() {
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148_Compressed.JPEG", "IMG_20260925_080504148_Compressed.JPEG"),
+            c(2, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(3, "a/IMG_20260925_compressed_080504148.jpg", "IMG_20260925_compressed_080504148.jpg"), // 非派生位置，不合并
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(2, out.size)
+        assertEquals(1, merged)
+    }
 }

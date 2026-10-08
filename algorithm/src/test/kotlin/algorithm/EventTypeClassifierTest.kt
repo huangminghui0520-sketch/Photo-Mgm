@@ -88,4 +88,51 @@ class EventTypeClassifierTest {
     @Test fun `联合巡查`() {
         assertEquals("联合巡查", EventTypeClassifier.classify("联合养护在K200+000M处开展联合巡查"))
     }
+
+    // ---- 2026-10-01 否定词优先：演练/演习/培训等非真实事件 → 待确认 ----
+
+    @Test fun `事故演练不被误判为事故`() {
+        assertEquals("待确认", EventTypeClassifier.classify("组织事故演练，参演人员20人"))
+    }
+
+    @Test fun `防汛演练不被误判为汛期处置`() {
+        assertEquals("待确认", EventTypeClassifier.classify("参加防汛演练，检查应急物资"))
+    }
+
+    @Test fun `培训类日志返回待确认`() {
+        assertEquals("待确认", EventTypeClassifier.classify("开展安全生产培训"))
+    }
+
+    @Test fun `无否定词时兜底仍为主线巡查`() {
+        assertEquals("主线巡查", EventTypeClassifier.classify("巡查人员张某某、李某某对全线进行巡查，路况正常"))
+    }
+
+    // ---- 2026-10-01 缺陷回归：9-27 日志「桥下空间」被误识别为「涉路施工监管」 ----
+
+    @Test fun `高架桥桥下空间巡查归桥下空间巡查而非涉路施工`() {
+        // ★ 旧实现：文本含「高架桥」→ 命中「涉路施工监管」关键词「架桥」→ 误判（缺陷证据）
+        assertEquals("桥下空间巡查",
+            EventTypeClassifier.classify("巡查人员巡查K117+430M新村高架桥，桥下空间未见异常，已拍照取证，做好记录，继续巡查。"))
+    }
+
+    @Test fun `借道桥下空间巡查归桥下空间巡查`() {
+        assertEquals("桥下空间巡查",
+            EventTypeClassifier.classify("借道西二环高速乐平收费站向桥下空间巡查。"))
+    }
+
+    @Test fun `互通高架桥桥下空间巡查不被互通词抢走`() {
+        assertEquals("桥下空间巡查",
+            EventTypeClassifier.classify("巡查人员巡查K121+830M三水高新互通高架桥，桥下空间未见异常，已拍照取证，做好记录，继续巡查。"))
+    }
+
+    @Test fun `匝道桥桥下空间巡查不被匝道词抢走`() {
+        assertEquals("桥下空间巡查",
+            EventTypeClassifier.classify("巡查人员巡查K122+430M高新区乐平站北行出口匝道桥，桥下空间未见异常，已拍照取证，做好记录，继续巡查。"))
+    }
+
+    @Test fun `施工场景仍归涉路施工监管`() {
+        // ★ 防回归：移除「架桥」不能误伤真实施工场景（靠「施工」命中）
+        assertEquals("涉路施工监管",
+            EventTypeClassifier.classify("巡查至K117+430M处，路面施工，现场围蔽完好"))
+    }
 }

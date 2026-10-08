@@ -21,6 +21,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,6 +31,9 @@ import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.LocalDate
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 
 data class UiState(
     val date: LocalDate = LocalDate.now(),
@@ -42,6 +47,8 @@ data class UiState(
     val classify: ClassifyResult? = null,
     val ledger: List<LedgerRow>? = null,
     val busy: Boolean = false,
+    /** ★ 2026-10-07 P2：流水线分阶段进度文案（busy 时在进度条下方显示；完成/失败置 null） */
+    val progressStage: String? = null,
     val message: String? = null,
     /** 人工移动：photoId → 目标事件（§8.3），持久化在 SettingsStore */
     val overrideMap: Map<Long, Int> = emptyMap(),
@@ -55,11 +62,43 @@ data class UiState(
     val lastExport: String? = null,
 )
 
+/**
+ * 缩略图预加载上限。
+ * 超过这个数量就放弃预加载、交回事件卡片的惰性加载：
+ * 一次解码上百张小图会长时间占用内存与主线程，收益不如让用户滚动时按需解码。
+ */
+private const val THUMB_PRELOAD_MAX = 500
+
+/**
+ * ★ 2026-10-08 P1-4：台账缩略图解码并发数（CPU 密集）。
+ * 单张解码峰值约 2MB（已采样 800×600），4 并发瞬时 ≈ 8MB，安全；真机可调。
+ */
+private const val THUMB_DECODE_CONCURRENCY = 4
+
+/**
+ * ★ 构造函数必须**只有 (Application) 一个参数**。
+ *
+ * 原因：框架的 `AndroidViewModelFactory` 通过反射查找恰好为 `(Application)` 的构造函数。
+ * 一旦增加第二个参数（即使它有默认值），工厂就找不到构造函数，抛出
+ * `RuntimeException: Cannot create an instance of class AppViewModel`，
+ * 而 MainActivity 第一行就是 `viewModel()` —— 结果是打开即闪退（2026-10-07 实际踩过）。
+ *
+ * 需要注入依赖时，用次级构造函数或工厂方法，**不要**动这个签名。
+ */
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = SettingsStore(app)
     private val repo = PhotoRepository(app)
 
-    /** 供平台组件获取 applicationContext（§2.4 核心不碰平台，本类负责提供）。 */
+    /**
+     * 缩略图缓存。默认接 Coil 全局单例（见 [CoilThumbnailCache]）。
+     *
+     * ★ `internal` setter 仅供单元测试注入假实现以验证"先清后缓存"的顺序——
+     *   因为构造函数签名不能被扩展（见上方注释），这是唯一安全的注入点。
+     */
+    internal var thumbCache: ThumbnailCache = CoilThumbnailCache(app)
+
+    /**
+     * ★ 供平台组件获取 applicationContext（§2.4 核心不碰平台，本类负责提供）。 */
     fun getApp(): Application = getApplication()
 
     private val _state = MutableStateFlow(UiState())
@@ -68,6 +107,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** ★ 自动流水线任务句柄：日期/源目录变更后触发，新变更取消旧任务，避免并发扫描。 */
     private var pipelineJob: Job? = null
 
+    /** ★ 单日照片缓存（进程内）：只保留**当前巡查日期**一份，换日期即覆盖（2026-10-07 采纳建议）。
+     *   跨进程重启由 SettingsStore 状态缓存兜底。 */
+    private data class DatePhotoCache(val date: LocalDate, val photos: List<Photo>, val coarseCount: Int)
+    private var photoCache: DatePhotoCache? = null
+
     init {
         _state.update {
             it.copy(
@@ -75,7 +119,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 outputDir = store.outputDir, namingTemplate = store.namingTemplate,
                 logsText = store.logsText, overrideMap = store.overrideMap,
                 marked = store.markedMap,
+                // ★ 2026-10-07 需求：打开 App 从缓存恢复关闭前的事件列表 + 分类 + 照片，
+                //   恢复后 coarseCount 非 null → ensurePipeline 视为已粗筛而跳过，不重跑流水线
+                parsed = store.parsedCache,
+                classify = store.classifyCache,
+                photos = store.photosCache,
+                coarseCount = store.coarseCountCache,
             )
+        }
+        // ★ 2026-10-07 防线一：恢复的照片**异步强制校验**——进程重启期间照片可能被删除/新增
+        //   （ContentObserver 收不到），靠这里发现：实时粗筛 ID 集合不一致 → 清照片/分类缓存 → 自动重扫。
+        //   parsed（事件列表）与照片无关，保留。
+        viewModelScope.launch(Dispatchers.IO) {
+            val s0 = state.value
+            if (s0.sourceDirs.isEmpty() || s0.photos.isEmpty()) return@launch
+            val latest = repo.coarseCandidatesFresh(s0.date, s0.sourceDirs)
+            if (latest.map { it.id }.toSet() != s0.photos.map { it.id }.toSet()) {
+                store.clearStateCache()
+                _state.update {
+                    it.copy(photos = emptyList(), coarseCount = null,
+                        classify = null, exportMessage = null)
+                }
+                autoPipeline()
+            }
         }
     }
 
@@ -83,20 +149,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * ★ 巡查日期变更：自动触发 粗筛→精读（无需手动点击）；同时清空下游避免旧分类配新日期导出错乱。
      * 清粗筛缓存（§4.4）→ 确保从 MediaStore 重新查询最新照片，再自动重新匹配。
+     *
+     * ★ 同时清空缩略图缓存：换日期后上一批照片的缩略图已无用，且会白占内存额度。
+     *   顺序为「清缓存 → 读取照片信息 → 预缓存新缩略图」，见 clearThumbnailCache / autoPipeline。
+     *
+     * ★ 2026-10-07（P1）：日期变更 = 旧解析/分类缓存全部失效（事件时间戳基于旧日期）。
+     *   内存 parsed 一并清空——界面回到"该日期尚未解析日志"，不残留旧日期事件；
+     *   日期照片缓存（datePhotoCache）保留，切回该日期秒恢复、不重扫。
      */
     fun setDate(d: LocalDate) {
+        // ★ 日期没变就不重跑：避免重复选同一天时清掉刚缓存的缩略图、导致界面闪一下重新解码
+        if (d == store.date) return
         store.date = d
         repo.clearCache()
-        _state.update { it.copy(date = d, classify = null, ledger = null, exportMessage = null) }
+        clearThumbnailCache()
+        store.clearStateCache()
+        _state.update {
+            it.copy(date = d, parsed = null, classify = null, ledger = null, exportMessage = null,
+                photos = emptyList(), coarseCount = null)
+        }
         autoPipeline()
     }
 
-    /** ★ 源目录变更：自动触发 粗筛→精读（照片集合已变，清空下游）。清缓存后重新查询最新照片。 */
+    /** ★ 源目录变更：自动触发 粗筛→精读（照片集合已变，清空下游）。清缓存后重新查询最新照片。
+     *  ★ 单日缓存：源目录变化 → 照片缓存失效（同日期不同源目录照片不同），清空 photoCache。 */
     fun addSourceDir(dir: String) {
         val dirs = (state.value.sourceDirs + dir).distinct()
         store.sourceDirs = dirs
         repo.clearCache()
-        _state.update { it.copy(sourceDirs = dirs, classify = null, ledger = null, exportMessage = null) }
+        clearThumbnailCache()
+        store.clearStateCache()
+        photoCache = null
+        _state.update { it.copy(sourceDirs = dirs, parsed = null, classify = null, ledger = null, exportMessage = null) }
         autoPipeline()
     }
 
@@ -104,12 +188,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val dirs = state.value.sourceDirs - dir
         store.sourceDirs = dirs
         repo.clearCache()
-        _state.update { it.copy(sourceDirs = dirs, classify = null, ledger = null, exportMessage = null) }
+        clearThumbnailCache()
+        store.clearStateCache()
+        photoCache = null
+        _state.update { it.copy(sourceDirs = dirs, parsed = null, classify = null, ledger = null, exportMessage = null) }
         autoPipeline()
     }
 
     /**
-     * ★ 自动流水线：粗筛 → 精读（§4）→ 若日志已解析则自动重新匹配（§5）。
+     * ★ 自动流水线：**粗筛必跑（强制实时）** → 校验单日缓存 ID 集合 → 一致复用 photos（跳过 EXIF）/
+     *   不一致或无缓存重新精读。**不做自动分类**（2026-10-07 需求：分类统一由「解析日志」触发）。
      * 变更即触发；取消旧任务防止快速连续操作导致旧结果覆盖新结果。
      */
     private fun autoPipeline() {
@@ -117,32 +205,80 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
             val s = state.value
             if (s.sourceDirs.isEmpty()) {
-                _state.update { it.copy(coarseCount = null, photos = emptyList(), busy = false) }
+                _state.update { it.copy(coarseCount = null, photos = emptyList(), busy = false, progressStage = null) }
                 return@launch
             }
             _state.update {
                 it.copy(busy = true, coarseCount = null, photos = emptyList(),
-                    classify = null, ledger = null, exportMessage = null)
+                    classify = null, ledger = null, exportMessage = null,
+                    overrideMap = emptyMap(), progressStage = "扫描照片中…")
             }
-            val cands = repo.coarseCandidates(s.date, s.sourceDirs)
+            // ★ 2026-10-07 与 parseLogs 同构：日期/源目录变化 = 全新一批照片与事件，上一批人工移动作废
+            store.overrideMap = emptyMap()
+            // ★ 防线一：强制实时粗筛（绕过 30 分钟 TTL）——拿最新 ID 集合，删除/新增照片立即感知
+            val cands = repo.coarseCandidatesFresh(s.date, s.sourceDirs)
             if (cands.isEmpty()) {
+                photoCache = null
                 _state.update {
-                    it.copy(coarseCount = 0, busy = false,
+                    it.copy(coarseCount = 0, busy = false, progressStage = null,
                         message = "所选日期（${s.date}）在源目录未找到照片，请检查日期或源目录")
                 }
+                saveStateCache(state.value.parsed, null, emptyList(), 0)
                 return@launch
             }
-            val photos = repo.readExif(cands)
-            _state.update { it.copy(coarseCount = cands.size, photos = photos) }
-            // ★ 日志已解析 → 自动重新匹配（日期/源目录变更后无需手动点「生成分类」）
-            val parsed = state.value.parsed
-            if (parsed != null && photos.isNotEmpty()) {
-                val g = AlgorithmApi.gpsGroup(photos)
-                val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
-                _state.update { it.copy(classify = c, busy = false) }
+            // ★ 校验：单日缓存命中且 ID 集合一致 → 复用（跳过 EXIF 精读）；否则重新精读
+            val cached = photoCache
+            val cachedIds = cached?.photos?.map { it.id }?.toSet() ?: emptySet()
+            val latestIds = cands.map { it.id }.toSet()
+            val photos = if (cached != null && cached.date == s.date && latestIds == cachedIds) {
+                cached.photos
             } else {
-                _state.update { it.copy(busy = false) }
+                _state.update { it.copy(progressStage = "读取照片信息中…") }
+                repo.readExif(cands)
             }
+            _state.update { it.copy(coarseCount = cands.size, photos = photos) }
+            // ★ 照片信息读取完成 → 预缓存本批缩略图（旧缓存已在 setDate/addSourceDir 阶段清空）
+            preloadThumbnailCache(photos)
+            // ★ 单日缓存：覆盖为当前日期
+            photoCache = DatePhotoCache(s.date, photos, cands.size)
+            // ★ 2026-10-07 需求：选取日期/源目录变更后**不做自动重新分类**。
+            //   旧日志事件的时间戳基于旧日期，对新日期照片分类无意义（会大量误入未匹配）。
+            //   分类统一由「解析日志」动作触发（parseLogs 内自动重新分类并写缓存）。
+            //   这里仅缓存照片元数据；classify 保持 null（界面显示"照片尚未就绪"引导重新解析）。
+            val parsed = state.value.parsed
+            _state.update {
+                it.copy(busy = false, progressStage = null,
+                    // ★ P2：该日期尚无解析结果时给引导
+                    message = if (parsed == null && photos.isNotEmpty())
+                        "已加载 ${s.date} 的照片 ${photos.size} 张，粘贴日志后点「解析日志」即自动分类"
+                    else null)
+            }
+            saveStateCache(parsed, null, photos, cands.size)
+        }
+    }
+
+    /**
+     * ★ 清空缩略图缓存（内存 + 磁盘）。
+     *
+     * 调用时机：巡查日期变更、源目录增删——即"上一批照片已经作废"的时刻。
+     * 顺序：clearThumbnailCache() → 粗筛 → 精读 EXIF → preloadThumbnailCache()
+     * 必须先清后读，否则新照片的预缓存会和上一批的残留混在同一份缓存里，旧图白占额度。
+     */
+    private fun clearThumbnailCache() {
+        runCatching { thumbCache.clear() }
+    }
+
+    /**
+     * ★ 预缓存本批照片的缩略图，写入内存缓存供事件卡片直接命中。
+     * 时机：EXIF 精读之后（此时才知道本批照片的真实路径）。
+     * 预加载在 Coil 内部异步进行，此处不阻塞流水线。
+     */
+    private fun preloadThumbnailCache(photos: List<Photo>) {
+        runCatching {
+            thumbCache.preload(
+                refs = photos.map { it.sourceRef },
+                maxCount = THUMB_PRELOAD_MAX,
+            )
         }
     }
 
@@ -193,26 +329,116 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun clearLogs() {
         store.logsText = ""
         repo.clearCache()
+        store.clearStateCache()
         _state.update { it.copy(logsText = "", parsed = null, classify = null, ledger = null, exportMessage = null) }
     }
 
-    /** ★ 重新解析日志：清匹配缓存 → 重新解析 → 若照片已就绪自动重新匹配（§5）。 */
-    fun parseLogs() = viewModelScope.launch(Dispatchers.Default) {
-        if (state.value.busy) return@launch
-        repo.clearCache()
-        // ★ 修复：置空 parsed 同时清空 classify，避免「旧分类 + 无 parsed」中间态导致导出 NPE
-        _state.update { it.copy(busy = true, parsed = null, classify = null, ledger = null) }
-        val p = AlgorithmApi.parseLog(state.value.logsText, state.value.date)
-        _state.update { it.copy(parsed = p) }
-        // ★ 照片已就绪 → 自动重新匹配（重新解析日志后无需手动点「生成分类」）
+    /**
+     * ★ 2026-10-07 需求重定义「解析日志」（P0：照片流水线与日志解析解耦）：
+     *   - 快路径：日志已解析、文本未改动、已有分类、**照片未增删**（防线一校验）→ **只清人工移动表
+     *     （overrideMap）**，分类恢复为最初自动分类状态；**不重跑粗筛/精读/分类**（classify 从未被
+     *     overrideMap 修改，它只是叠加层，清掉即恢复最初分类）。
+     *   - 照片复用：**强制实时粗筛校验一致**（防线一：删除/新增照片立即感知）→ 只重新解析文本 +
+     *     用现有照片重新分类，**不重扫 MediaStore / 不重读 EXIF / 不清缩略图缓存**（毫秒级）。
+     *   - 完整流水线：照片未就绪或**校验不一致（照片已增删）**→ 清缓存重新 粗筛→精读→分类。
+     * ★ 2026-10-08 修复：快路径前置照片校验——否则删除照片后文本未改仍命中快路径，
+     *   旧 classify 引用已删照片 URI → 事件网格显示灰色方块缩略图。
+     */
+    fun parseLogs() {
         val s = state.value
-        if (s.photos.isNotEmpty()) {
-            val g = AlgorithmApi.gpsGroup(s.photos)
+        pipelineJob?.cancel()
+        pipelineJob = viewModelScope.launch(Dispatchers.IO) {
+            // ── 快路径：已解析 + 已分类 + 文本未变 + 照片未增删 → 只清人工移动表 ──
+            if (s.parsed != null && s.classify != null && s.logsText == store.parsedLogsText) {
+                // ★ 防线一：照片校验——删除/新增照片后即使文本未改也要重扫重分类，
+                //   避免旧 classify 引用失效 URI（灰块）。
+                val photosUnchanged = s.sourceDirs.isEmpty() || s.photos.isEmpty() ||
+                    repo.coarseCandidatesFresh(s.date, s.sourceDirs)
+                        .map { it.id }.toSet() == s.photos.map { it.id }.toSet()
+                if (photosUnchanged) {
+                    val n = s.overrideMap.size
+                    store.overrideMap = emptyMap()
+                    _state.update {
+                        it.copy(
+                            overrideMap = emptyMap(),
+                            message = if (n > 0) "已恢复最初分类（清除 $n 条人工移动）" else "已是最初分类状态",
+                        )
+                    }
+                    return@launch
+                }
+                // 照片已增删 → 落入下方完整流水线（清缓存重扫 + 重新解析分类）
+            }
+            store.overrideMap = emptyMap()
+            // ★ 记录本次解析的文本快照（供"只清人工移动"分支判定日志是否被修改）
+            store.parsedLogsText = s.logsText
+            _state.update {
+                it.copy(busy = true, parsed = null, classify = null, ledger = null,
+                    exportMessage = null, overrideMap = emptyMap(), progressStage = "解析日志中…")
+            }
+            val p = AlgorithmApi.parseLog(s.logsText, s.date)
+            // ── 照片获取：防线一（强制实时粗筛）决定 复用 or 完整重扫 ──
+            if (s.sourceDirs.isEmpty()) {
+                _state.update { it.copy(parsed = p, busy = false, progressStage = null) }
+                saveStateCache(p, null, emptyList(), 0)
+                return@launch
+            }
+            val latestCands = repo.coarseCandidatesFresh(s.date, s.sourceDirs)
+            if (latestCands.isEmpty()) {
+                photoCache = null
+                _state.update {
+                    it.copy(parsed = p, coarseCount = 0, photos = emptyList(), busy = false,
+                        progressStage = null,
+                        message = "所选日期（${s.date}）在源目录未找到照片，请检查日期或源目录")
+                }
+                saveStateCache(p, null, emptyList(), 0)
+                return@launch
+            }
+            val latestIds = latestCands.map { it.id }.toSet()
+            val photos: List<Photo>
+            val coarse: Int
+            if (s.photos.isNotEmpty() && latestIds == s.photos.map { it.id }.toSet()) {
+                // ★ 校验一致 → 复用现有照片（不重扫、不清缩略图缓存）
+                photos = s.photos
+                coarse = s.coarseCount ?: s.photos.size
+            } else {
+                // 照片未就绪或已增删 → 完整精读（粗筛已实时跑过）
+                repo.clearCache()
+                clearThumbnailCache()
+                _state.update { it.copy(parsed = p, progressStage = "读取照片信息中…") }
+                photos = repo.readExif(latestCands)
+                coarse = latestCands.size
+            }
+            // ★ 同步进程内单日缓存
+            photoCache = DatePhotoCache(s.date, photos, coarse)
+            preloadThumbnailCache(photos)
+            // ★ 日志已解析 + 照片已就绪 → 自动重新分类（重新解析日志后无需手动点「生成分类」）
+            _state.update { it.copy(parsed = p, progressStage = "分类中…") }
+            val g = AlgorithmApi.gpsGroup(photos)
             val c = AlgorithmApi.classify(p.events, g.clusters, g.singles, s.date, g.splitCount)
-            _state.update { it.copy(classify = c, busy = false) }
-        } else {
-            _state.update { it.copy(busy = false) }
+            _state.update {
+                it.copy(coarseCount = coarse, photos = photos, classify = c, busy = false,
+                    progressStage = null)
+            }
+            // ★ 流水线完成 → 写状态缓存（打开 App 恢复用）
+            saveStateCache(p, c, photos, coarse)
         }
+    }
+
+    /**
+     * ★ 2026-10-07 防线二：手动刷新照片缓存（设置页入口）。
+     * 清进程内单日缓存 + 粗筛缓存 + 缩略图缓存 + 持久化状态缓存，强制完整重扫。
+     * 事件列表（parsed）保留——照片变化不影响日志事件；重新解析即自动重新分类。
+     */
+    fun refreshPhotoCache() {
+        photoCache = null
+        repo.clearCache()
+        clearThumbnailCache()
+        store.clearStateCache()
+        _state.update {
+            it.copy(photos = emptyList(), coarseCount = null,
+                classify = null, ledger = null, exportMessage = null)
+        }
+        autoPipeline()
     }
 
     // ---------- 分类 + 台账（§5/§6/§7） ----------
@@ -221,18 +447,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val s = state.value
         val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
         if (s.photos.isEmpty()) { _state.update { it.copy(message = "无照片（请先粗筛并精读）") }; return@launch }
-        _state.update { it.copy(busy = true, classify = null) }
+        // ★ 2026-10-07 修复：手动「生成分类」= 全新分配，上一批人工移动（overrideMap）作废
+        store.overrideMap = emptyMap()
+        _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
         val g = AlgorithmApi.gpsGroup(s.photos)
         val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
-        _state.update { it.copy(classify = c, busy = false) }
+        _state.update { it.copy(classify = c, busy = false, progressStage = null) }
+        // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
+        saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
     }
 
+    /**
+     * ★ 2026-10-08 技术债统一：台账行生成**唯一入口**（photoById 建表 O(1) + null 保护）。
+     * buildLedger() 与 prepareLedger() 都走这里，避免两处生成逻辑分叉。
+     */
+    private fun buildRows(s: UiState, eventPhotoMap: Map<Int, List<Long>>): List<LedgerRow>? {
+        val c = s.classify ?: return null
+        val parsed = s.parsed ?: return null
+        val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
+        // ★ 传入人工台账标记，否则「设为台账」在导出时被静默忽略
+        return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked)
+    }
+
+    /**
+     * 单独生成台账行并存入 state（**当前无 UI 入口**，保留供将来做台账预览页）。
+     *
+     * 注意：ZIP 导出路径走 [prepareLedger]，不经过本方法——本方法是独立入口，
+     * 若将来删除"台账预览"计划，应连同 [UiState.ledger] 的语义一并清理。
+     */
     fun buildLedger() = viewModelScope.launch(Dispatchers.Default) {
         val s = state.value
         val c = s.classify ?: return@launch
-        val parsed = s.parsed ?: return@launch   // ★ 修复：禁止对 null parsed 强解包
-        val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
-        val rows = AlgorithmApi.buildLedger(parsed.events, effectiveMap(c), photoById)
+        val rows = buildRows(s, effectiveMap(c)) ?: return@launch
         _state.update { it.copy(ledger = rows) }
     }
 
@@ -266,87 +512,84 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(overrideMap = map) }
     }
 
+    /** ★ 重置全部人工移动（2026-10-01 新增）：清空 overrideMap，恢复纯自动分类结果（撤销所有手动调整）。 */
+    fun resetOverrides() {
+        store.overrideMap = emptyMap()
+        _state.update { it.copy(overrideMap = emptyMap(), message = "已重置全部人工移动，恢复自动分类结果") }
+    }
+
     fun clearMessage() { _state.update { it.copy(message = null, exportMessage = null) } }
 
     /** ★ UI 轻提示（Snackbar）：供界面层校验类提示（如禁止跨事件移动）使用。 */
     fun notify(msg: String) { _state.update { it.copy(message = msg) } }
 
-    // ---------- 导出（§7.3 Excel / §7.4 ZIP，经 AlgorithmApi 单向调用核心） ----------
+    // ---------- 状态缓存（§8.4.2：打开 App 恢复事件列表 + 分类） ----------
 
-    /** 导出台账 Excel：yyyyMMdd.xlsx（§7.3）。输出目录支持 SAF 树 URI 或本地路径。 */
-    fun exportLedger() = viewModelScope.launch(Dispatchers.IO) {
-        if (state.value.busy) return@launch
-        val s = state.value
-        // ★ 修复：未设置输出目录禁止导出（不再静默写默认目录）
-        if (s.outputDir.isNullOrBlank()) {
-            _state.update { it.copy(message = "未设置输出目录，请先在「设置」页选择或输入输出目录后再导出") }
-            return@launch
-        }
-        val c = s.classify ?: run { _state.update { it.copy(message = "请先在预览页生成分类") }; return@launch }
-        val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
-        _state.update { it.copy(exportProgress = 0.05f, exportMessage = null, lastExport = null) }
-        try {
-            // ★ 台账内容准备（buildLedger + 图片预收集），与 ZIP 导出共用同一逻辑
-            val prep = prepareLedger(s, effectiveMap(c)) { frac -> _state.update { it.copy(exportProgress = frac) } }
-                ?: throw IllegalStateException("台账数据准备失败")
-            val (rows, bytesCache, imgDebug) = prep
-            // ★ 文件名：yyyyMMdd.xlsx
-            val fileName = java.time.LocalDate.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")) + ".xlsx"
-            val (os, shown) = openOutputSink(fileName)
-            if (os == null) { _state.update { it.copy(exportMessage = "导出失败：无法写入输出目录", exportProgress = null) }; return@launch }
-            _state.update { it.copy(exportProgress = 0.85f) }
-            os.use { AlgorithmApi.exportLedgerXlsx(rows, it) { ref -> bytesCache[ref] } }
-            _state.update {
-                it.copy(
-                    exportMessage = "台账已导出（${rows.size} 行，$imgDebug）",
-                    exportProgress = null, ledger = rows, lastExport = shown,
-                )
-            }
-        } catch (e: Exception) {
-            _state.update { it.copy(exportMessage = "台账导出失败：${e.message}", exportProgress = null) }
+    /** ★ 写入状态缓存（事件列表 + 分类 + 照片 + 粗筛数）。JSON 序列化由 SettingsStore 完成。 */
+    private fun saveStateCache(
+        parsed: algorithm.ParsedLog?,
+        classify: algorithm.ClassifyResult?,
+        photos: List<algorithm.model.Photo>,
+        coarseCount: Int,
+    ) {
+        runCatching {
+            store.parsedCache = parsed
+            store.classifyCache = classify
+            store.photosCache = photos
+            store.coarseCountCache = coarseCount
         }
     }
 
+    // ---------- 导出（§7.3 Excel / §7.4 ZIP，经 AlgorithmApi 单向调用核心） ----------
+
     /**
-     * 台账内容准备（§7.3，导出 Excel / ZIP 共用）：
-     * buildLedger → 收集照片字节（4:3 裁剪 400px JPEG50）→ 返回 (rows, 图片字节缓存, 调试统计)。
+     * 台账内容准备（§7.3，ZIP 导出使用）：
+     * buildRows → 并行解码照片字节（4:3 裁剪 400px JPEG50）→ 返回 (rows, 图片字节缓存, 调试统计)。
      * 失败返回 null。
      * @param eventPhotoMap 打包前一刻的最终分类快照（台账与 ZIP 共用，保证照片一致）
-     * @param onProgress 图片预收集进度回调（0.1..0.7 区间）
+     * @param onProgress 图片预收集进度回调（0.1..0.7 区间；★ 2026-10-08 并行 + 每 5 张节流）
      */
-    private fun prepareLedger(
+    private suspend fun prepareLedger(
         s: UiState,
         eventPhotoMap: Map<Int, List<Long>>,
         onProgress: (Float) -> Unit = {},
     ): Triple<List<LedgerRow>, Map<String, ByteArray?>, String>? {
         return try {
-            val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
-            val rows = AlgorithmApi.buildLedger(s.parsed!!.events, eventPhotoMap, photoById)
+            val rows = buildRows(s, eventPhotoMap) ?: return null
             // ★ 分区存储：sourceRef 是 MediaStore DATA 物理路径，Android 10+ 无法直接 decodeFile，
             //   用 Photo.id 构造 content://media/... URI 读取（App 有 READ_MEDIA_IMAGES 权限）。
             val ctx = getApp()
             val photoByRef: Map<String, Photo> = s.photos.associateBy { it.sourceRef }
-            val bytesCache = mutableMapOf<String, ByteArray?>()
             val refs = rows.flatMap { listOfNotNull(it.photo1Ref, it.photo2Ref) }.distinct()
-            var imgOk = 0; var imgFail = 0
-            val failDetails = mutableListOf<String>()
-            refs.forEachIndexed { i, ref ->
-                val photo = photoByRef[ref]
-                val readRef = photo?.let { p ->
-                    if (ref.startsWith("/") || ref.startsWith("file:"))
-                        ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, p.id).toString()
-                    else ref
-                } ?: ref
-                val bytes = ImageUtils.process(ctx, readRef)
-                if (bytes != null && bytes.isNotEmpty()) imgOk++ else {
-                    imgFail++
-                    failDetails.add("${ref.substringAfterLast('/')}(found=${photo != null},id=${photo?.id})")
-                }
-                bytesCache[ref] = bytes
-                onProgress(0.1f + 0.6f * (i + 1) / refs.size.coerceAtLeast(1))
+            if (refs.isEmpty()) return Triple(rows, emptyMap(), "图片:成功0/失败0")
+            // ★ 2026-10-08 P1-4/P1-6：并行解码（固定并发，Dispatchers.Default 自然限流）
+            //   async 任务按 refs 顺序 await 保序；计数/容器并发安全；进度每 5 张一跳。
+            val done = AtomicInteger(0); val ok = AtomicInteger(0); val fail = AtomicInteger(0)
+            val failures = ConcurrentLinkedQueue<String>()
+            val bytesCache = ConcurrentHashMap<String, ByteArray?>()
+            val total = refs.size
+            coroutineScope {
+                refs.map { ref ->
+                    async(Dispatchers.Default) {
+                        val photo = photoByRef[ref]
+                        val readRef = photo?.let { p ->
+                            if (ref.startsWith("/") || ref.startsWith("file:"))
+                                ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, p.id).toString()
+                            else ref
+                        } ?: ref
+                        val bytes = ImageUtils.process(ctx, readRef)
+                        if (bytes != null && bytes.isNotEmpty()) ok.incrementAndGet() else {
+                            fail.incrementAndGet()
+                            failures.add("${ref.substringAfterLast('/')}(found=${photo != null},id=${photo?.id})")
+                        }
+                        bytesCache[ref] = bytes
+                        val n = done.incrementAndGet()
+                        if (n % 5 == 0 || n == total) onProgress(0.1f + 0.6f * n / total.coerceAtLeast(1))
+                    }
+                }.forEach { it.await() }
             }
-            val imgDebug = "图片:成功$imgOk/失败$imgFail" + if (failDetails.isNotEmpty()) " 失败[${failDetails.joinToString(",")}]" else ""
+            val imgDebug = "图片:成功${ok.get()}/失败${fail.get()}" +
+                if (failures.isNotEmpty()) " 失败[${failures.joinToString(",")}]" else ""
             Triple(rows, bytesCache, imgDebug)
         } catch (e: Exception) {
             null
@@ -398,17 +641,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val c = s.classify ?: run { _state.update { it.copy(message = "请先在预览页生成分类") }; return@launch }
         val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
         _state.update { it.copy(exportProgress = 0f) }
+        // ★ 2026-10-08 P0-3：临时文件声明移到 try 外——导出失败也必须清理（含原图，可达几十 MB）
+        val fileName = "照片分类_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_" +
+                java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("HHmmss")) + ".zip"
+        // ★ 断点续传状态文件与输出位置解耦（放 app 私有 files 目录），避免输出目录切换丢失
+        val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
+        val tmpZip = File(getApp().cacheDir, fileName)
         try {
-            val photoById: (Long) -> Photo? = { id -> s.photos.find { it.id == id } }
+            // ★ 2026-10-08 P0-2：photoById 建表 O(1)（替代线性 find，与 photoByRef 对齐）
+            val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
             // ★ 打包前一刻计算最终分类快照（合并人工移动/移除），台账与打包共用同一份，保证照片一致
             val finalMap = effectiveMap(c)
             val finalUnmatched = effectiveUnmatched(c)
-            // ★ ZIP 文件名：导出时刻 yyyyMMdd_HHmmss.zip
-            val fileName = java.time.LocalDateTime.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")) + ".zip"
-            // ★ 断点续传状态文件与输出位置解耦（放 app 私有 files 目录），避免输出目录切换丢失
-            val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
-            val tmpZip = File(getApp().cacheDir, fileName)
 
             // ★ 台账 Excel 准备（用同一个 finalMap，保证台账照片 = 实际打包的照片）
             val prep = prepareLedger(s, finalMap) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
@@ -417,24 +662,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { AlgorithmApi.exportLedgerXlsx(rows, bos) { ref -> cache[ref] } }
                     .getOrNull()?.let { bos.toByteArray() }
             }
-            val xlsxName = java.time.LocalDate.now()
-                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd")) + ".xlsx"
+            // ★ 台账文件名含巡查日期 + 时分秒：区分"导出时刻"与"巡查日期"，
+            //   并避免同日二次导出时同名被静默覆盖（SAF findFile 会复用同名文档）。
+            val now = java.time.LocalDateTime.now()
+            val stamp = now.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
+            val xlsxName = "巡查台账_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_$stamp.xlsx"
             val extraFiles = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) mapOf(xlsxName to xlsxBytes) else emptyMap()
 
             val r = AlgorithmApi.exportZip(parsed.events, finalMap, finalUnmatched,
-                photoById, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles) { frac, _ ->
+                photoById::get, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles) { frac, _ ->
                 _state.update { it.copy(exportProgress = 0.6f + 0.4f * frac) }
             }
             if (r.copied > 0 || r.failed > 0) {
                 copyToOutput(tmpZip, fileName).also { tmpZip.delete() }
             }
             val skipNote = if (r.skippedFromState > 0) "（跳过已完成 ${r.skippedFromState}）" else ""
-            val xlsxNote = if (extraFiles.isNotEmpty()) " + 台账Excel" else "（台账未生成）"
+            // ★ 2026-10-08 P0-1：Excel 生成结果附图片统计/失败明细，失败可诊断（不再静默降级）
+            val xlsxNote = if (extraFiles.isNotEmpty()) {
+                val dbg = prep?.third.orEmpty()
+                if (dbg.isNotBlank()) " + 台账Excel（$dbg）" else " + 台账Excel"
+            } else {
+                "（台账未生成：${prep?.third ?: "准备失败"}）"
+            }
             _state.update {
-                it.copy(exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}$skipNote$xlsxNote",
-                    exportProgress = null)
+                it.copy(
+                    exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}$skipNote$xlsxNote",
+                    exportProgress = null,
+                    // ★ 回填台账行：底部操作条要显示「台账 N 行」，也需要它判断导出完成。
+                    //   以前此处不回填，导致 state.ledger 永远为 null、底栏永远显示"台账待生成"。
+                    ledger = prep?.first ?: it.ledger,
+                )
             }
         } catch (e: Exception) {
+            // ★ 2026-10-08 P0-3：失败也清理临时 ZIP（可能含全部原图，几十 MB）
+            runCatching { tmpZip.delete() }
             _state.update { it.copy(exportMessage = "ZIP 导出失败：${e.message}", exportProgress = null) }
         }
     }

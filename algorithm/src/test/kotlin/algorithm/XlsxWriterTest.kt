@@ -54,17 +54,17 @@ class XlsxWriterTest {
             XlsxWriter.write(listOf(row(), row(), row()), it)
         }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        // 数据行首列 = 1/2/3（A2/A3/A4）
-        assertTrue(sheet.contains("""<c r="A2" t="inlineStr"><is><t xml:space="preserve">1</t></is></c>"""))
-        assertTrue(sheet.contains("""<c r="A3" t="inlineStr"><is><t xml:space="preserve">2</t></is></c>"""))
-        assertTrue(sheet.contains("""<c r="A4" t="inlineStr"><is><t xml:space="preserve">3</t></is></c>"""))
+        // 数据行首列 = 1/2/3（A2/A3/A4），且为数字单元格（无 t 属性）
+        assertTrue(sheet.contains("""<c r="A2"><v>1</v></c>"""), "A2 应为数字 1")
+        assertTrue(sheet.contains("""<c r="A3"><v>2</v></c>"""), "A3 应为数字 2")
+        assertTrue(sheet.contains("""<c r="A4"><v>3</v></c>"""), "A4 应为数字 3")
     }
 
     @Test fun `列宽与行高符合方案`() {
         val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row()), it) }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        // 列宽 A:8 B:18 C:24 D:60 E:20 F:20
-        for ((min, w) in listOf(1 to 8, 2 to 18, 3 to 24, 4 to 60, 5 to 20, 6 to 20)) {
+        // 列宽 A:8 B:18 C:24 D:60 E:22 F:22（★ 2026-10-08 E/F 20→22：容纳 3.81cm 嵌入照片，防横向溢出）
+        for ((min, w) in listOf(1 to 8, 2 to 18, 3 to 24, 4 to 60, 5 to 22, 6 to 22)) {
             assertTrue(sheet.contains("""<col min="$min" max="$min" width="$w" customWidth="1"/>"""),
                 "列宽 $min 应为 $w")
         }
@@ -80,6 +80,139 @@ class XlsxWriterTest {
         assertTrue(sheet.contains("""<c r="D2" s="1" t="inlineStr">"""), "日志内容列 D2 应带 s=1")
         val styles = entries(bytes).first { it.first == "xl/styles.xml" }.second
         assertTrue(styles.contains("""wrapText="1""""), "styles.xml 应有 wrapText 对齐")
+    }
+
+    /**
+     * ★ XML 非法控制字符必须被剔除。
+     *
+     * 背景：escape 原先只转义 5 个实体，不过滤控制字符。日志从 Word/PDF 粘贴常带 \v(0x0B)/\f(0x0C)，
+     * 而 XML 1.0 完全禁止这些码点 —— 一个字符就让 sheet1.xml 无法解析、Excel 报"文件损坏"，
+     * 整个台账打不开（与历史上的 `s="1` 缺陷同级）。
+     */
+    @Test fun `日志含XML非法控制字符时仍为良构XML`() {
+        val dirty = "巡查\u000B发现\u000C护栏\u0000损坏\u001F，已\u0007处理"
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(desc = dirty)), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        // 必须能被解析（这一步就验证了非法字符已被剔除）
+        javax.xml.parsers.DocumentBuilderFactory.newInstance()
+            .apply { isNamespaceAware = false }.newDocumentBuilder()
+            .parse(org.xml.sax.InputSource(java.io.StringReader(sheet)))
+        // 合法内容要保留，非法控制字符要消失
+        assertTrue(sheet.contains("巡查") && sheet.contains("护栏") && sheet.contains("处理"), "应保留可见文字")
+        assertTrue(!sheet.contains('\u000B'), "不应残留 \\u000B")
+        assertTrue(!sheet.contains('\u000C'), "不应残留 \\u000C")
+        assertTrue(!sheet.contains('\u0000'), "不应残留 \\u0000")
+        assertTrue(!sheet.contains('\u001F'), "不应残留 \\u001F")
+    }
+
+    /** 序号必须是数字单元格（无 t 属性），否则 Excel 报"数字以文本存储"且无法排序求和。 */
+    @Test fun `序号列为数字单元格而非文本`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(), row()), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains("""<c r="A2"><v>1</v></c>"""), "A2 应为数字单元格")
+        assertTrue(sheet.contains("""<c r="A3"><v>2</v></c>"""), "A3 应为数字单元格")
+        assertTrue(!sheet.contains("""<c r="A2" t="inlineStr">"""), "序号不应再是 inlineStr 文本")
+    }
+
+    /** 行高估算必须计入显式换行：customHeight=1 禁止 Excel 自动撑高，估算偏小会裁切多行日志。 */
+    @Test fun `多行日志的行高大于单行短日志`() {
+        fun rowHeightOf(desc: String): Int {
+            val bytes = ByteArrayOutputStream().also {
+                XlsxWriter.write(listOf(row(desc = desc)), it)
+            }.toByteArray()
+            val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+            return Regex("""<row r="2" ht="(\d+)"""").find(sheet)!!.groupValues[1].toInt()
+        }
+        // 10 个换行、每段很短：按字符数折算只需 1 行，按换行需 10 行
+        val multiline = (1..10).joinToString("\n") { "短" }
+        val hMulti = rowHeightOf(multiline)
+        val hShort = rowHeightOf("短")
+        println("ROWHEIGHT short=$hShort multiline=$hMulti")
+        assertTrue(
+            hMulti > hShort,
+            "含 10 个换行的日志行高($hMulti) 应显著大于单行短日志($hShort)",
+        )
+        // 10 行 × 16pt + 8pt = 168pt
+        assertTrue(hMulti >= 168, "行高应不小于 10 行文本所需(168pt)，实际 $hMulti")
+    }
+
+    /**
+     * ★ 图片必须固定尺寸（oneCellAnchor + a:ext），不能随行高拉伸。
+     *
+     * 背景：原先用 twoCellAnchor 锚满"1 列 × 1 行"，而数据行高随日志长度增长。
+     * 日志超过约 150 字时行高 > 81pt，图片被纵向拉伸（300 字 → 168pt → 2.07 倍），
+     * 4:3 取证照片失真。改为 oneCellAnchor 固定尺寸后，行高怎么变图片都是 4:3。
+     */
+    @Test fun `图片锚定为固定尺寸不随行高拉伸`() {
+        val jpg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(), 0x00, 0x10,
+            0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0xFF.toByte(), 0xD9.toByte())
+        val loader: (String?) -> ByteArray? = { ref -> if (ref != null) jpg else null }
+
+        fun drawingOf(desc: String): Pair<Int, String> {
+            val bytes = ByteArrayOutputStream().also {
+                XlsxWriter.write(listOf(row(p1 = "a.jpg", p2 = "b.jpg", desc = desc)), it, loader)
+            }.toByteArray()
+            val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+            val h = Regex("""<row r="2" ht="(\d+)"""").find(sheet)!!.groupValues[1].toInt()
+            return h to entries(bytes).first { it.first == "xl/drawings/drawing1.xml" }.second
+        }
+
+        val (hShort, dShort) = drawingOf("护栏检查")
+        val (hLong, dLong) = drawingOf("巡".repeat(300))
+
+        // 前提：两次行高确实不同（否则这个用例证明不了什么）
+        assertEquals(81, hShort, "短描述行高应为 81pt")
+        assertTrue(hLong > 81, "300 字描述行高应 >81pt，实际 $hLong")
+
+        // 断言 1：用 oneCellAnchor（固定尺寸），不是 twoCellAnchor（随行高拉伸）
+        assertTrue(dShort.contains("<xdr:oneCellAnchor>"), "应使用 oneCellAnchor")
+        assertTrue(!dShort.contains("<xdr:twoCellAnchor"), "不应再用 twoCellAnchor")
+
+        // 断言 2：尺寸由 a:ext 显式给出，且 4:3（1371600 × 1028700 EMU）
+        assertTrue(
+            dShort.contains("""<xdr:ext cx="1371600" cy="1028700"/>"""),
+            "应有固定尺寸 a:ext（4:3）",
+        )
+
+        // 断言 3：核心——行高差一倍，锚定尺寸必须完全一致（图片不随行高变化）
+        val extShort = Regex("""<xdr:ext cx="\d+" cy="\d+"/>""").find(dShort)?.value
+        val extLong = Regex("""<xdr:ext cx="\d+" cy="\d+"/>""").find(dLong)?.value
+        assertEquals(extShort, extLong, "行高变化时图片尺寸必须保持不变")
+        // 断言 4：drawing XML 良构
+        javax.xml.parsers.DocumentBuilderFactory.newInstance()
+            .apply { isNamespaceAware = false }.newDocumentBuilder()
+            .parse(org.xml.sax.InputSource(java.io.StringReader(dLong)))
+    }
+
+    /**
+     * ★ 后置条件：整个数据行必须是良构 XML。
+     *
+     * 背景：样式属性曾写成 `""" s="1"""`（缺前导空格），`$r$style` 直接拼接后闭合引号
+     * 被并入属性值，产出 `<c r="D2" s="1 t="inlineStr">` —— 畸形 XML，整个 xlsx 部件
+     * 损坏。当时只断言"是否含 s=1"，而畸形输出恰好也含该子串，于是漏判。
+     * 此用例直接解析 XML，可捕获任意属性拼接错误。
+     */
+    @Test fun `数据行输出为良构XML`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(desc = "巡查发现护栏损坏，已通知养护单位处理"), row()), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        val doc = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+            .apply { isNamespaceAware = false }.newDocumentBuilder()
+            .parse(org.xml.sax.InputSource(java.io.StringReader(sheet)))
+        val cells = doc.getElementsByTagName("c")
+        var dStyled = 0
+        for (i in 0 until cells.length) {
+            val c = cells.item(i) as org.w3c.dom.Element
+            if (c.getAttribute("r").startsWith("D") && c.getAttribute("r") != "D1") {
+                if (c.getAttribute("s") == "1") dStyled++
+            }
+        }
+        assertEquals(2, dStyled, "两条数据行的 D 列都应带样式 s=1")
     }
 
     @Test fun `照片列写文件名最后一段`() {

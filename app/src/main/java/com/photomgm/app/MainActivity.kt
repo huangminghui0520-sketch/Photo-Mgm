@@ -1,4 +1,5 @@
 // app/MainActivity.kt —— 入口：权限 + Scaffold + SnackbarHost + 导航
+// ★ 2026-10-07 UI 重建：结构与原实现等价，重新书写。
 package com.photomgm.app
 
 import android.Manifest
@@ -13,16 +14,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.photomgm.app.theme.PhotoMgmTheme
-import com.photomgm.app.ui.AppBottomBar
 import com.photomgm.app.ui.AppNav
 
 class MainActivity : ComponentActivity() {
@@ -40,7 +37,6 @@ class MainActivity : ComponentActivity() {
                 ) { }
                 LaunchedEffect(Unit) { launcher.launch(mediaPerm) }
 
-                var tab by rememberSaveable { mutableStateOf("settings") }
                 val snackbarHostState = remember { SnackbarHostState() }
                 val state by vm.state.collectAsState()
 
@@ -53,9 +49,8 @@ class MainActivity : ComponentActivity() {
 
                 Scaffold(
                     snackbarHost = { SnackbarHost(snackbarHostState) },
-                    bottomBar     = { AppBottomBar(tab) { tab = it } },
                 ) { inner ->
-                    AppNav(vm, tab, Modifier.padding(inner))
+                    AppNav(vm, Modifier.padding(inner))
                 }
             }
         }

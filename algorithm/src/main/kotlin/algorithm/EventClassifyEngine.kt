@@ -1,10 +1,11 @@
 // algorithm/EventClassifyEngine.kt —— §6 事件分类模块
-// 窗口规则（★ 终点归属 + 首条特例，用户定稿）：
-//   通用：事件B 照片 = [记录A, 记录B) → 归事件B（终点归属，照片归到「记录时间 > 拍摄时间」的第一条日志）
-//   首条特例：交接班（第一条）吸收 [dayStart, 第二条记录时间) —— 交接班到出车之间的照片单独归集到交接班
-//   末条闭区间（≥ 末条记录时间 → 末条，含跨日加班次日照片）
+// 窗口规则（2026-10-01 改进：补拍回看 + 终点兜底，替代原纯终点归属）：
+//   ① 首条特例：交接班（第一条）吸收 [dayStart, 第二条记录时间) —— 交接班到出车之间的照片单独归集到交接班
+//   ② 补拍回看：记录时间 r ≤ t 且 t - r ≤ backfillMs（默认 120s）→ 归该事件（记录时刻之后的补拍照不再推给下一事件）
+//   ③ 终点兜底：否则照片归到「记录时间 > 拍摄时间」的第一条日志（先拍后记场景保持不变）
+//   ④ 末条闭区间（≥ 末条记录时间 → 末条，含跨日加班次日照片）
 // 归属流程（§6.2）：① 簇整体按 representativeTime 归窗口 ② 无GPS单张按时间 ③ 其余 → unmatched
-// 人工干预提示（§6.3）：GPS_FAR / CLUSTER_SPLIT / TIME_OVERLAP / CLUSTER_SPAN（提示级，不阻断）
+// 人工干预提示（§6.3）：GPS_FAR / CLUSTER_SPLIT / TIME_OVERLAP / CLUSTER_SPAN / NO_PHOTO（提示级，不阻断）
 package algorithm
 
 import algorithm.model.Cluster
@@ -17,7 +18,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-enum class Kind { GPS_FAR, CLUSTER_SPLIT, TIME_OVERLAP, CLUSTER_SPAN }
+enum class Kind { GPS_FAR, CLUSTER_SPLIT, TIME_OVERLAP, CLUSTER_SPAN, NO_PHOTO }
 
 data class Intervention(
     val kind: Kind,
@@ -34,12 +35,18 @@ data class ClassifyResult(
 )
 
 class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
+    companion object {
+        /** 补拍回看容差：记录时刻之后 backfillMs 内拍摄的照片仍归该事件（默认 120 秒，设 0 退化为纯终点归属）。 */
+        const val DEFAULT_BACKFILL_MS = 120_000L
+    }
+
     fun classify(
         events: List<LogEvent>,
         clusters: List<Cluster>,
         singles: List<Photo>,
         patrolDate: LocalDate,
         splitCount: Int = 0,                    // GPS 层自动拆簇次数 → CLUSTER_SPLIT 提示
+        backfillMs: Long = DEFAULT_BACKFILL_MS, // 补拍回看容差（毫秒）
     ): ClassifyResult {
         val zone = ZoneId.systemDefault()
         val sorted = events.sortedBy { it.endTimeMs ?: Long.MAX_VALUE }
@@ -56,32 +63,58 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
         for (c in clusters) {
             val t = c.representativeTimeMs
             if (t == null) { unmatched.addAll(c.photos.map { it.id }); continue }
-            val target = findWindow(t, timed, dayStart)
+            val target = findWindow(t, timed, dayStart, backfillMs)
             if (target != null) {
                 assigned[target.id]!!.addAll(c.photos.map { it.id })
                 if (c.outlierPhotos.isNotEmpty()) interventions.add(
                     Intervention(Kind.GPS_FAR, "该组照片 GPS 定位相差较大，可能属于不同事件", c.outlierPhotos.map { it.id }))
+                // ★ 簇内最早/最晚照片跨到不同事件 → 提示（簇可能黏连多个事件）
+                if (c.photos.size > 1) {
+                    val times = c.photos.mapNotNull { it.captureTimeMs }
+                    if (times.isNotEmpty()) {
+                        val eFirst = findWindow(times.min(), timed, dayStart, backfillMs)
+                        val eLast = findWindow(times.max(), timed, dayStart, backfillMs)
+                        if (eFirst != null && eLast != null && eFirst.id != eLast.id) {
+                            interventions.add(Intervention(
+                                Kind.CLUSTER_SPAN,
+                                "该组照片时间跨度跨越事件「${eFirst.eventType} → ${eLast.eventType}」，可能包含多个事件，请核对",
+                                c.photos.map { it.id }, listOf(eFirst.id, eLast.id)))
+                        }
+                    }
+                }
             } else unmatched.addAll(c.photos.map { it.id })
         }
         // ② 无 GPS 单张按时间
         for (p in singles) {
             val t = p.captureTimeMs
             if (t == null) { unmatched.add(p.id); continue }
-            val target = findWindow(t, timed, dayStart)
+            val target = findWindow(t, timed, dayStart, backfillMs)
             if (target != null) assigned[target.id]!!.add(p.id) else unmatched.add(p.id)
         }
-        // 时间穿插提示（后一条 start < 前一条 endTime）
+        // 时间穿插提示（后一条 start < 前一条 endTime）+ 间隔过近提示（间隔 < 2×backfillMs）
         // ★ 增强：消息明确标注穿插的两个事件（编号/类型/时间区间/地点），供预览页人工核对
         for (i in 1 until timed.size) {
             val prev = timed[i - 1]; val cur = timed[i]
             val prevEnd = prev.endTimeMs ?: prev.startTimeMs!!
-            if (cur.startTimeMs!! < prevEnd) interventions.add(
-                Intervention(
-                    Kind.TIME_OVERLAP,
-                    "事件时间穿插：${evtInfo(prev)} 与 ${evtInfo(cur)} 时间重叠，请人工核对照片归属",
-                    assigned[cur.id]!!,
-                    relatedEventIds = listOf(prev.id, cur.id),
-                ))
+            val curStart = cur.startTimeMs!!
+            val curEnd = cur.endTimeMs ?: cur.startTimeMs!!
+            if (curStart < prevEnd) {
+                interventions.add(
+                    Intervention(
+                        Kind.TIME_OVERLAP,
+                        "事件时间穿插：${evtInfo(prev)} 与 ${evtInfo(cur)} 时间重叠，请人工核对照片归属",
+                        assigned[cur.id]!!,
+                        relatedEventIds = listOf(prev.id, cur.id),
+                    ))
+            } else if (curEnd - prevEnd < backfillMs * 2) {
+                interventions.add(
+                    Intervention(
+                        Kind.TIME_OVERLAP,
+                        "事件时间过近：${evtInfo(prev)} 与 ${evtInfo(cur)} 间隔不足 ${backfillMs * 2 / 1000} 秒，照片归属易混淆，请核对",
+                        emptyList(),
+                        relatedEventIds = listOf(prev.id, cur.id),
+                    ))
+            }
         }
         // 事件内多簇中心离散提示（CLUSTER_SPAN）
         for (e in timed) {
@@ -97,6 +130,16 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
         // 自动拆簇提示（§6.3 承诺、§6.4 遗漏 → 完善补回）
         if (splitCount > 0) interventions.add(
             Intervention(Kind.CLUSTER_SPLIT, "已按时间自动拆分 $splitCount 组，请核对", emptyList()))
+        // 事件无照片提示（日志提到拍照/取证但照片数为 0 → 可能被误归其他事件）
+        for (e in timed) {
+            val d = e.description
+            if (assigned[e.id]!!.isEmpty() && (d.contains("拍照") || d.contains("取证"))) {
+                interventions.add(Intervention(
+                    Kind.NO_PHOTO,
+                    "事件「${evtInfo(e)}」日志提到拍照/取证但无照片，可能被误归其他事件，请核对",
+                    emptyList(), listOf(e.id)))
+            }
+        }
         // 待定事件提示（人工指定时间后重算）
         if (pending.isNotEmpty()) interventions.add(
             Intervention(
@@ -112,21 +155,33 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
     }
 
     /**
-     * 窗口归属（★ 终点归属 + 首条特例，用户定稿）：
+     * 窗口归属（2026-10-01 改进：补拍回看 + 终点兜底）：
      *   - 首条（交接班）吸收 [dayStart, 第二条记录时间)：交接班到出车之间的照片单独归集到交接班
-     *   - 通用终点归属：照片归到「记录时间 > 拍摄时间」的第一条日志（事件B = [记录A, 记录B) 归事件B）
+     *   - 补拍回看：最近的记录时间 r ≤ t 且 t - r ≤ backfillMs → 归该事件（记录时刻之后的补拍照归回原事件，
+     *     修复「记录后 1 秒~几分钟的取证照被推给下一事件」的错位；backfillMs=0 退化为纯终点归属）
+     *   - 终点兜底：照片归到「记录时间 > 拍摄时间」的第一条日志（先拍后记场景保持原行为）
      *   - 末条闭区间：t ≥ 末条记录时间 → 末条（含跨日加班次日照片）
      *   - t < dayStart（异常早）→ null（unmatched）
      */
-    private fun findWindow(t: Long, events: List<LogEvent>, dayStart: Long): LogEvent? {
+    private fun findWindow(t: Long, events: List<LogEvent>, dayStart: Long, backfillMs: Long): LogEvent? {
         if (t < dayStart) return null
         val second = events.getOrNull(1)?.let { it.endTimeMs ?: it.startTimeMs!! }
         if (second != null && t < second) return events[0]
+        // 补拍回看：记录时间 ≤ t 的最近一条事件（events 已按记录时间升序）
+        var last: Pair<LogEvent, Long>? = null
         for (e in events) {
             val r = e.endTimeMs ?: e.startTimeMs!!
-            if (t < r) return e
+            if (r <= t) {
+                last = e to r
+            } else {
+                val lb = last
+                if (lb != null && t - lb.second <= backfillMs) return lb.first
+                return e   // 终点兜底：第一条「记录时间 > 拍摄时间」的日志
+            }
         }
-        return events.last()
+        // 末条闭区间：全部记录时间 ≤ t
+        val lb = last
+        return if (lb != null && t - lb.second <= backfillMs) lb.first else events.last()
     }
 
     /** 事件摘要（编号/类型/时间区间/地点），用于干预提示明确标注核对对象。 */

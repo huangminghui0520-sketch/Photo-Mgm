@@ -8,6 +8,7 @@
         android:maxSdkVersion="32" />
 
     <application
+        android:name=".PhotoMgmApp"
         android:label="Photo-Mgm"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"

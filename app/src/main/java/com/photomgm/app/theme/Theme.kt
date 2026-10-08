@@ -1,4 +1,5 @@
 // app/theme/Theme.kt —— Material3 主题（光/暗自适应 + 中文排版优化 + 形状系统）
+// ★ 2026-10-07 UI 重建：沿用原色板（公路巡查·工业精致风），结构与实现全新书写。
 package com.photomgm.app.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -19,29 +20,25 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 // ──────────────────────────────────────────────────────────────────
-// 色板（公路巡查·工业精致风：深青绿主色 + 琥珀辅色 + 暖灰中性色）
+// 色板（深青绿主色 + 琥珀辅色 + 暖灰中性色）
 // ──────────────────────────────────────────────────────────────────
-private val LightPrimary       = Color(0xFF0E5C6B)     // 深青绿 · 权威 / 可信
+private val LightPrimary       = Color(0xFF0E5C6B)
 private val LightOnPrimary     = Color(0xFFFFFFFF)
 private val LightPrimaryCtr    = Color(0xFFB7E9F0)
 private val LightOnPrimaryCtr  = Color(0xFF002027)
-
-private val LightSecondary     = Color(0xFF5D6167)     // 冷灰 · 中性次级
+private val LightSecondary     = Color(0xFF5D6167)
 private val LightOnSecondary   = Color(0xFFFFFFFF)
 private val LightSecondaryCtr  = Color(0xFFE1E2E8)
 private val LightOnSecondaryCtr= Color(0xFF1A1C1E)
-
-private val LightTertiary      = Color(0xFFC96A00)     // 琥珀 · 警示 / 导出 / 重点操作
+private val LightTertiary      = Color(0xFFC96A00)
 private val LightOnTertiary    = Color(0xFFFFFFFF)
 private val LightTertiaryCtr   = Color(0xFFFFDCC2)
 private val LightOnTertiaryCtr = Color(0xFF401E00)
-
 private val LightError         = Color(0xFFBA1A1A)
 private val LightOnError       = Color(0xFFFFFFFF)
 private val LightErrorCtr      = Color(0xFFFFDAD6)
 private val LightOnErrorCtr    = Color(0xFF410002)
-
-private val LightSurface       = Color(0xFFFAFAF7)     // 暖米白底 · 减冷感
+private val LightSurface       = Color(0xFFFAFAF7)
 private val LightOnSurface     = Color(0xFF1A1C1E)
 private val LightSurfaceVar    = Color(0xFFE0E3E4)
 private val LightOnSurfaceVar  = Color(0xFF434849)
@@ -55,22 +52,18 @@ private val DarkPrimary        = Color(0xFF7FD2DF)
 private val DarkOnPrimary      = Color(0xFF00363E)
 private val DarkPrimaryCtr     = Color(0xFF004F59)
 private val DarkOnPrimaryCtr   = Color(0xFFB7E9F0)
-
 private val DarkSecondary      = Color(0xFFC5C6CC)
 private val DarkOnSecondary    = Color(0xFF2F3134)
 private val DarkSecondaryCtr   = Color(0xFF44474B)
 private val DarkOnSecondaryCtr = Color(0xFFE1E2E8)
-
 private val DarkTertiary       = Color(0xFFFFB780)
 private val DarkOnTertiary     = Color(0xFF663600)
 private val DarkTertiaryCtr    = Color(0xFF8C4E00)
 private val DarkOnTertiaryCtr  = Color(0xFFFFDCC2)
-
 private val DarkError          = Color(0xFFFFB4AB)
 private val DarkOnError        = Color(0xFF690005)
 private val DarkErrorCtr       = Color(0xFF93000A)
 private val DarkOnErrorCtr     = Color(0xFFFFDAD6)
-
 private val DarkSurface        = Color(0xFF121316)
 private val DarkOnSurface      = Color(0xFFE3E2E0)
 private val DarkSurfaceVar     = Color(0xFF434849)

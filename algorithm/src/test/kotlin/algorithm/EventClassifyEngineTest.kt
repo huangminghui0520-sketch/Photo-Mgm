@@ -40,15 +40,15 @@ class EventClassifyEngineTest {
         assertTrue(r.eventPhotoMap[2]!!.isEmpty())
     }
 
-    @Test fun `边界_照片时间等于本条记录时间归本条之后的下一事件_半开`() {
-        // 照片 08:15 == E2 记录时间 → [08:15,09:00) 半开 → 归 E3
+    @Test fun `边界_照片时间等于本条记录时间归本条事件_补拍回看`() {
+        // 照片 08:15 == E2 记录时间 → 补拍回看 0 秒 → 归 E2（2026-10-01 规则变更：不再推给下一事件）
         val e1 = ev(1, at(8, 0), at(8, 0), "交接班")
         val e2 = ev(2, at(8, 15), at(8, 15), "出车")
         val e3 = ev(3, at(9, 0), at(9, 0), "事件X")
         val c = cluster(11, at(8, 15))
         val r = engine.classify(listOf(e1, e2, e3), listOf(c), emptyList(), date)
-        assertTrue(r.eventPhotoMap[3]!!.contains(11L), "t == E2 记录 → 属 [E2, E3) → 归下一事件")
-        assertTrue(r.eventPhotoMap[2]!!.isEmpty())
+        assertTrue(r.eventPhotoMap[2]!!.contains(11L), "t == E2 记录时间 → 归本条（补拍回看 0s ≤ backfillMs）")
+        assertTrue(r.eventPhotoMap[3]!!.isEmpty())
     }
 
     // ---- 用户契约：首条交接班吸收到第二条记录 ----
@@ -139,5 +139,70 @@ class EventClassifyEngineTest {
         val r = engine.classify(listOf(e1), emptyList(), emptyList(), date, splitCount = 2)
         assertTrue(r.interventions.any { it.kind == Kind.CLUSTER_SPLIT && it.message.contains("2") },
             "GPS 层自动拆簇次数需 CLUSTER_SPLIT 提示")
+    }
+
+    // ---- 2026-10-01 规则改进：补拍回看 + 终点兜底（修复记录后补拍照被推给下一事件） ----
+
+    @Test fun `记录后补拍归原事件`() {
+        // E2 记录 08:15、E3 记录 09:00；照片 08:15:30（记录后 30 秒补拍）→ 归 E2（旧规则推给 E3）
+        val e1 = ev(1, at(8, 0), at(8, 0), "交接班")
+        val e2 = ev(2, at(8, 15), at(8, 15), "出车")
+        val e3 = ev(3, at(9, 0), at(9, 0), "事件X")
+        val c = cluster(11, at(8, 15) + 30_000)
+        val r = engine.classify(listOf(e1, e2, e3), listOf(c), emptyList(), date)
+        assertTrue(r.eventPhotoMap[2]!!.contains(11L), "记录后 30 秒补拍归原事件（backfillMs=120s）")
+        assertTrue(r.eventPhotoMap[3]!!.isEmpty())
+    }
+
+    @Test fun `补拍超过容差归下一事件`() {
+        // backfillMs=60s，照片 08:16:30（距 E2 90s > 60s）→ 终点兜底归 E3
+        val e1 = ev(1, at(8, 0), at(8, 0), "交接班")
+        val e2 = ev(2, at(8, 15), at(8, 15), "出车")
+        val e3 = ev(3, at(9, 0), at(9, 0), "事件X")
+        val c = cluster(11, at(8, 16) + 30_000)
+        val r = engine.classify(listOf(e1, e2, e3), listOf(c), emptyList(), date, backfillMs = 60_000)
+        assertTrue(r.eventPhotoMap[3]!!.contains(11L), "补拍超过容差 → 终点兜底归下一事件")
+    }
+
+    @Test fun `backfillMs为0退化为纯终点归属`() {
+        val e1 = ev(1, at(8, 0), at(8, 0), "交接班")
+        val e2 = ev(2, at(8, 15), at(8, 15), "出车")
+        val e3 = ev(3, at(9, 0), at(9, 0), "事件X")
+        val c = cluster(11, at(8, 15) + 30_000)
+        val r = engine.classify(listOf(e1, e2, e3), listOf(c), emptyList(), date, backfillMs = 0)
+        assertTrue(r.eventPhotoMap[3]!!.contains(11L), "backfillMs=0 → 纯终点归属（回滚开关）")
+        assertTrue(r.eventPhotoMap[2]!!.isEmpty())
+    }
+
+    @Test fun `相邻事件间隔过近产生TIME_OVERLAP提示`() {
+        // E2 记录 08:15、E3 记录 08:16（间隔 1min < 2×120s）→ 过近提示
+        val e1 = ev(1, at(8, 0), at(8, 0), "交接班")
+        val e2 = ev(2, at(8, 15), at(8, 15), "出车")
+        val e3 = ev(3, at(8, 16), at(8, 16), "事件X")
+        val r = engine.classify(listOf(e1, e2, e3), emptyList(), emptyList(), date)
+        assertTrue(r.interventions.any { it.kind == Kind.TIME_OVERLAP && it.message.contains("过近") },
+            "相邻事件间隔不足 2×backfillMs 需提示人工核对")
+    }
+
+    @Test fun `日志提到拍照但无照片产生NO_PHOTO提示`() {
+        val e1 = ev(1, at(9, 0), at(10, 0), "取证事件")
+            .copy(description = "发现标牌损坏，已拍照取证")
+        val r = engine.classify(listOf(e1), emptyList(), emptyList(), date)
+        assertTrue(r.interventions.any { it.kind == Kind.NO_PHOTO && it.relatedEventIds.contains(1) },
+            "日志提到拍照/取证但照片数为 0 需提示人工核对")
+    }
+
+    @Test fun `簇内照片跨越两个事件产生CLUSTER_SPAN提示`() {
+        // E2 记录 09:30、E3 记录 10:00；簇照片 09:31（归 E2）与 09:59:30（归 E3）→ 跨事件提示
+        val e1 = ev(1, at(9, 0), at(9, 0), "事件A")
+        val e2 = ev(2, at(9, 30), at(9, 30), "事件B")
+        val e3 = ev(3, at(10, 0), at(10, 0), "事件C")
+        val c = Cluster(
+            listOf(photo(11, at(9, 31)), photo(12, at(9, 59) + 30_000)),
+            at(9, 31), 23.0, 113.0, emptyList())
+        val r = engine.classify(listOf(e1, e2, e3), listOf(c), emptyList(), date)
+        assertTrue(r.interventions.any {
+            it.kind == Kind.CLUSTER_SPAN && it.photoIds.containsAll(listOf(11L, 12L))
+        }, "簇内最早/最晚照片跨不同事件需提示核对")
     }
 }

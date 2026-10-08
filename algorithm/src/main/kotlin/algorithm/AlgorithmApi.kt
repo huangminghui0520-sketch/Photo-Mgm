@@ -22,7 +22,8 @@ object AlgorithmApi {
         timeWindowMs: Long = 5 * 60 * 1000,
     ): GpsGroupResult = GpsGrouperEngine(maxDistanceM, timeWindowMs).group(photos)
 
-    /** 事件分类（§6）：簇 + 单张 按窗口归事件，输出 归属表/未匹配/干预提示/待定事件。 */
+    /** 事件分类（§6）：簇 + 单张 按窗口归事件，输出 归属表/未匹配/干预提示/待定事件。
+     *  @param backfillMs 补拍回看容差（毫秒，默认 120s）：记录时刻之后 backfillMs 内拍摄的照片仍归该事件。 */
     fun classify(
         events: List<LogEvent>,
         clusters: List<Cluster>,
@@ -30,14 +31,17 @@ object AlgorithmApi {
         patrolDate: LocalDate,
         splitCount: Int = 0,
         maxDistanceM: Double = 50.0,
-    ): ClassifyResult = EventClassifyEngine(maxDistanceM).classify(events, clusters, singles, patrolDate, splitCount)
+        backfillMs: Long = EventClassifyEngine.DEFAULT_BACKFILL_MS,
+    ): ClassifyResult = EventClassifyEngine(maxDistanceM).classify(events, clusters, singles, patrolDate, splitCount, backfillMs)
 
-    /** 台账生成（§7）：事件 + 分类结果 → 每事件一行（日期/地点/日志内容/照片第一张+最后一张）。 */
+    /** 台账生成（§7）：事件 + 分类结果 → 每事件一行（日期/地点/日志内容/照片第一张+最后一张）。
+     *  @param marked 人工台账标记：eventId -> (照片1, 照片2)；某一侧为 null 表示该侧用默认（最早/最晚） */
     fun buildLedger(
         events: List<LogEvent>,
         eventPhotoMap: Map<Int, List<Long>>,
         photoById: (Long) -> Photo?,
-    ): List<LedgerRow> = LedgerEngine().buildLedger(events, eventPhotoMap, photoById)
+        marked: Map<Int, Pair<Long?, Long?>> = emptyMap(),
+    ): List<LedgerRow> = LedgerEngine().buildLedger(events, eventPhotoMap, photoById, marked)
 
     /** Excel 写入（§7.3）：LedgerRow → .xlsx 字节流（纯 Kotlin OOXML，可移植 PC）。
      *  @param imageLoader 照片引用 → 图片字节（JPEG/PNG），嵌入台账照片列；返回 null/缺省 则照片列仅写文件名。 */
