@@ -11,10 +11,12 @@ import java.util.zip.ZipInputStream
 
 class XlsxWriterTest {
     private fun row(date: String = "2026-09-03 08:30",
+                    end: String = "2026-09-03 10:00",
                     loc: String = "K138+700M", desc: String = "护栏检查 & 修复",
                     p1: String? = "DCIM/Camera/IMG_20260903_083001.jpg",
-                    p2: String? = null) =
-        LedgerRow(date, loc, desc, p1, p2)
+                    p2: String? = null,
+                    folder: String = "") =
+        LedgerRow(date, end, loc, desc, p1, p2, folder)
 
     private fun entries(bytes: ByteArray): List<Pair<String, String>> {
         val out = mutableListOf<Pair<String, String>>()
@@ -38,15 +40,57 @@ class XlsxWriterTest {
         assertTrue("xl/styles.xml" in names)
     }
 
-    @Test fun `表头6列与数据行写入sheet`() {
+    @Test fun `表头7列与数据行写入sheet`() {
         val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row()), it) }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        for (h in listOf("序号", "日期", "地点", "日志内容", "照片1", "照片2")) {
+        for (h in listOf("序号", "日期", "结束时间", "地点", "日志内容", "照片1", "照片2")) {
             assertTrue(sheet.contains("<t xml:space=\"preserve\">$h</t>"), "表头缺 $h")
         }
-        assertTrue(sheet.contains("2026-09-03 08:30"))
+        assertTrue(sheet.contains("""<c r="B2" s="2"><v>46268.35"""), "B 列日期应为真实日期序列号")
+        assertTrue(sheet.contains("""<c r="C2" s="2"><v>46268.4166"""), "C 列结束时间应为真实日期序列号")
         assertTrue(sheet.contains("K138+700M"))
         assertTrue(sheet.contains("护栏检查 &amp; 修复"))
+    }
+
+    @Test fun `日期与结束时间为真实日期类型`() {
+        val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row()), it) }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        // P2-2：2026-09-03 08:30 → 序列号 46268.35417；10:00 → 46268.41667
+        assertTrue(sheet.contains("""<c r="B2" s="2"><v>46268.35"""), "B2 序列号(2026-09-03 08:30)")
+        assertTrue(sheet.contains("""<c r="C2" s="2"><v>46268.4166"""), "C2 序列号(2026-09-03 10:00)")
+        assertTrue(!sheet.contains("<t xml:space=\"preserve\">2026-09-03 08:30</t>"), "不应再写文本日期")
+        val styles = entries(bytes).first { it.first == "xl/styles.xml" }.second
+        assertTrue(styles.contains("""numFmtId="164""""), "styles 应有自定义日期格式 164")
+        assertTrue(styles.contains("""formatCode="yyyy-mm-dd hh:mm""""), "格式码应为 yyyy-mm-dd hh:mm")
+        assertTrue(styles.contains("""cellXfs count="3""""), "cellXfs 应为 3 条（0 默认/1 wrapText/2 日期）")
+    }
+
+    @Test fun `空日期回退文本且不报错`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(date = "", end = "")), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains("""<c r="B2" t="inlineStr">"""), "空日期 B2 回退为文本单元格")
+        assertTrue(!sheet.contains("""<c r="B2" s="2">"""), "空日期不应套日期样式")
+    }
+
+    @Test fun `异常日期字符串回退文本`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(date = "上午巡查", end = "09-03 10:00")), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains("""<t xml:space="preserve">上午巡查</t>"""), "异常日期回退文本")
+        assertTrue(sheet.contains("""<t xml:space="preserve">09-03 10:00</t>"""), "异常结束时间回退文本")
+    }
+
+    @Test fun `跨日结束时间序列号正确`() {
+        // 09-03 23:30 开始 → 46268.97917；09-04 01:00 结束 → 46269.04167（+1 天）
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(date = "2026-09-03 23:30", end = "2026-09-04 01:00")), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains("""<c r="B2" s="2"><v>46268.9791"""), "B2=09-03 23:30 序列号")
+        assertTrue(sheet.contains("""<c r="C2" s="2"><v>46269.0416"""), "C2=09-04 01:00 序列号(+1 天)")
     }
 
     @Test fun `序号为程序生成行号`() {
@@ -63,8 +107,8 @@ class XlsxWriterTest {
     @Test fun `列宽与行高符合方案`() {
         val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row()), it) }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        // 列宽 A:8 B:18 C:24 D:60 E:22 F:22（★ 2026-10-08 E/F 20→22：容纳 3.81cm 嵌入照片，防横向溢出）
-        for ((min, w) in listOf(1 to 8, 2 to 18, 3 to 24, 4 to 60, 5 to 22, 6 to 22)) {
+        // 列宽 A:8 B:18 C:18 D:24 E:60 F:22 G:22（2026-10-18 P1-1 新增 C=结束时间 18）
+        for ((min, w) in listOf(1 to 8, 2 to 18, 3 to 18, 4 to 24, 5 to 60, 6 to 22, 7 to 22)) {
             assertTrue(sheet.contains("""<col min="$min" max="$min" width="$w" customWidth="1"/>"""),
                 "列宽 $min 应为 $w")
         }
@@ -76,8 +120,8 @@ class XlsxWriterTest {
     @Test fun `日志内容列应用wrapText样式`() {
         val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row()), it) }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        // D2 单元格应用样式 1（wrapText）
-        assertTrue(sheet.contains("""<c r="D2" s="1" t="inlineStr">"""), "日志内容列 D2 应带 s=1")
+        // E2 单元格应用样式 1（wrapText）
+        assertTrue(sheet.contains("""<c r="E2" s="1" t="inlineStr">"""), "日志内容列 E2 应带 s=1")
         val styles = entries(bytes).first { it.first == "xl/styles.xml" }.second
         assertTrue(styles.contains("""wrapText="1""""), "styles.xml 应有 wrapText 对齐")
     }
@@ -205,14 +249,14 @@ class XlsxWriterTest {
             .apply { isNamespaceAware = false }.newDocumentBuilder()
             .parse(org.xml.sax.InputSource(java.io.StringReader(sheet)))
         val cells = doc.getElementsByTagName("c")
-        var dStyled = 0
+        var eStyled = 0
         for (i in 0 until cells.length) {
             val c = cells.item(i) as org.w3c.dom.Element
-            if (c.getAttribute("r").startsWith("D") && c.getAttribute("r") != "D1") {
-                if (c.getAttribute("s") == "1") dStyled++
+            if (c.getAttribute("r").startsWith("E") && c.getAttribute("r") != "E1") {
+                if (c.getAttribute("s") == "1") eStyled++
             }
         }
-        assertEquals(2, dStyled, "两条数据行的 D 列都应带样式 s=1")
+        assertEquals(2, eStyled, "两条数据行的 E 列都应带样式 s=1")
     }
 
     @Test fun `照片列写文件名最后一段`() {
@@ -224,6 +268,16 @@ class XlsxWriterTest {
         assertTrue(sheet.contains("IMG_20260903_083001.jpg"))
         assertTrue(sheet.contains("IMG_0002.png"))
         assertTrue(!sheet.contains("DCIM/Camera/"))
+    }
+
+    @Test fun `照片列带文件夹名前缀`() {
+        // 回归 P1-3/P2-4：folderName 非空时照片列写 "文件夹名/文件名"（含序号前缀），消除跨文件夹同名歧义
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(folder = "01_0908_巡查至北行K123+000M", p1 = "IMG_01.jpg")), it)
+        }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains("01_0908_巡查至北行K123+000M/IMG_01.jpg"), "照片列应含 文件夹名/文件名")
+        assertTrue(!sheet.contains("<t xml:space=\"preserve\">IMG_01.jpg</t>"), "不应再只写裸文件名")
     }
 
     @Test fun `特殊字符XML转义`() {
@@ -238,11 +292,11 @@ class XlsxWriterTest {
     @Test fun `空照片列输出空单元格`() {
         val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row(p1 = null, p2 = null)), it) }.toByteArray()
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
-        // 表头 6 列 + 数据 6 列 = 12 个单元格（含 2 空照片列）
-        assertEquals(12, Regex("""<c r="[A-F]""").findAll(sheet).count())
+        // 表头 7 列 + 数据 7 列 = 14 个单元格（含 2 空照片列）
+        assertEquals(14, Regex("""<c r="[A-G]""").findAll(sheet).count())
     }
 
-    // ---- ★ §7.3 照片嵌入（锚定 E/F 列，0-based 4/5） ----
+    // ---- ★ §7.3 照片嵌入（锚定 F/G 列，0-based 5/6） ----
 
     @Test fun `嵌入照片时生成media与drawing部件`() {
         val jpg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(), 0x00, 0x10,
@@ -263,8 +317,8 @@ class XlsxWriterTest {
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
         assertTrue(sheet.contains("""<drawing r:id="rIdDraw1"/>"""), "sheet 引用 drawing")
         val drawing = entries(bytes).first { it.first == "xl/drawings/drawing1.xml" }.second
-        assertTrue(drawing.contains("""<xdr:from><xdr:col>4</xdr:col>"""), "照片1 锚定第 5 列(E)")
-        assertTrue(drawing.contains("""<xdr:from><xdr:col>5</xdr:col>"""), "照片2 锚定第 6 列(F)")
+        assertTrue(drawing.contains("""<xdr:from><xdr:col>5</xdr:col>"""), "照片1 锚定第 6 列(F)")
+        assertTrue(drawing.contains("""<xdr:from><xdr:col>6</xdr:col>"""), "照片2 锚定第 7 列(G)")
         assertTrue(drawing.contains("""<xdr:row>1</xdr:row>"""), "数据行 1 锚定")
     }
 

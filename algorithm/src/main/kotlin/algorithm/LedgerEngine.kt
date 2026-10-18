@@ -1,5 +1,6 @@
 // algorithm/LedgerEngine.kt —— §7 台账与导出模块
-// 台账字段（导出Excel 2.0 方案）：日期(yyyy-MM-dd HH:mm 开始时间)/地点(桩号优先)/日志内容/照片1、2
+// 台账字段（导出Excel 2.0 方案）：日期(yyyy-MM-dd HH:mm 开始时间)/结束时间/地点(桩号优先)/日志内容/照片1、2
+// ★ 2026-10-18 P1-1：新增结束时间列；单时间点事件结束时间留空（起止相同无意义）。
 //
 // 照片1/照片2 的取值规则（2026-10-07 修订）：
 //   1. 人工标记优先：marked[eventId].first → 照片1、.second → 照片2
@@ -20,6 +21,9 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 class LedgerEngine {
+    /** ZIP 文件夹命名器（P1-3：与导出打包共用命名规则，保证台账照片列前缀与 ZIP 内路径一致）。 */
+    private val folderNamer = ZipExporter()
+
     /**
      * 生成台账行（每事件一行）。
      *
@@ -27,13 +31,18 @@ class LedgerEngine {
      * @param eventPhotoMap eventId -> photoIds（来自 §6 分类结果，应已合并人工移动）
      * @param photoById 照片解析回调；返回 null 的照片跳过
      * @param marked 人工台账标记：eventId -> (照片1, 照片2)；某一侧为 null 表示该侧用默认（最早/最晚）
+     * @param namingTemplate 事件文件夹命名模板（与 ZipExporter 一致，0=事件类型 1=月日+日志内容）；
+     *                       用于照片列的"文件夹名/文件名"前缀（P1-3）
      */
     fun buildLedger(
         events: List<LogEvent>,
         eventPhotoMap: Map<Int, List<Long>>,
         photoById: (Long) -> Photo?,
         marked: Map<Int, Pair<Long?, Long?>> = emptyMap(),
+        namingTemplate: Int = 0,
     ): List<LedgerRow> {
+        // ★ 2026-10-18 P2-4：与 ZIP 共用"排序 + 序号前缀"文件夹名 → 台账照片列前缀 = ZIP 内路径
+        val folderByName = folderNamer.numberedFolderNames(events, namingTemplate)
         return events.sortedBy { it.endTimeMs ?: Long.MAX_VALUE }.map { e ->
             // 按分类结果顺序解析照片（保留列表顺序，作为"全无时间"时的兜底次序）
             val photos = (eventPhotoMap[e.id] ?: emptyList()).mapNotNull { photoById(it) }
@@ -41,10 +50,13 @@ class LedgerEngine {
 
             LedgerRow(
                 dateTime = formatDateTime(e),
+                endTime = formatEndTime(e),
                 location = e.location,
                 description = e.description,
                 photo1Ref = p1?.sourceRef,
                 photo2Ref = p2?.sourceRef,
+                // ★ 2026-10-18 P1-3/P2-4：文件夹名 = 排序序号前缀 + 事件文件夹（与 ZIP 分类文件夹一致）
+                folderName = folderByName[e.id] ?: "",
             )
         }
     }
@@ -52,6 +64,14 @@ class LedgerEngine {
     /** 日期列：事件开始时间 → "yyyy-MM-dd HH:mm"（含巡查日期；无开始时间 → 空串）。 */
     private fun formatDateTime(e: LogEvent): String {
         val s = e.startTimeMs ?: return ""
+        return Instant.ofEpochMilli(s).atZone(ZoneId.systemDefault()).format(DATE_TIME)
+    }
+
+    /** 结束时间列：事件结束时间 → "yyyy-MM-dd HH:mm"；无结束时间或单时间点事件 → 空串。 */
+    private fun formatEndTime(e: LogEvent): String {
+        val s = e.endTimeMs ?: return ""
+        // 单时间点事件（起止相同）：结束时间留空，避免 "08:30 ~ 08:30" 冗余
+        if (s == e.startTimeMs) return ""
         return Instant.ofEpochMilli(s).atZone(ZoneId.systemDefault()).format(DATE_TIME)
     }
 

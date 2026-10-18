@@ -56,8 +56,10 @@ data class GpsGroupResult(
 /** 台账行（每事件一行，导出Excel 2.0 方案 §7） */
 data class LedgerRow(
     val dateTime: String,        // "yyyy-MM-dd HH:mm"（事件开始时间，含巡查日期）
+    val endTime: String = "",    // "yyyy-MM-dd HH:mm"（事件结束时间；无结束时间或单时间点事件为空）
     val location: String,        // 完整位置描述（桩号优先）
     val description: String,     // 日志内容
     val photo1Ref: String?,      // 事件第一张（最早）照片
     val photo2Ref: String?,      // 事件最后一张（最晚）照片
+    val folderName: String = "", // ZIP 内该事件的分类文件夹名（2026-10-18 P1-3：照片列前缀，消除跨文件夹同名歧义）
 )

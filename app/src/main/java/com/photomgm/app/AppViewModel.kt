@@ -465,8 +465,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val c = s.classify ?: return null
         val parsed = s.parsed ?: return null
         val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
-        // ★ 传入人工台账标记，否则「设为台账」在导出时被静默忽略
-        return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked)
+        // ★ 传入人工台账标记，否则「设为台账」在导出时被静默忽略；
+        //   namingTemplate 保证台账照片列"文件夹名/文件名"前缀与 ZIP 分类文件夹一致（P1-3）
+        return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked, s.namingTemplate)
     }
 
     /**
@@ -668,15 +669,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val stamp = now.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
             val xlsxName = "巡查台账_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_$stamp.xlsx"
             val extraFiles = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) mapOf(xlsxName to xlsxBytes) else emptyMap()
+            // ★ 2026-10-18 P0-2：台账 xlsx 单独落缓存（App 外部私有目录，FileProvider 可打开），
+            //   供导出后「打开台账」直接打开；ZIP 内的 xlsx 不便直开。台账失败时为 null。
+            val xlsxCachePath = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) {
+                runCatching {
+                    val dir = File(getApp().getExternalFilesDir(null), "export").apply { mkdirs() }
+                    val f = File(dir, xlsxName)
+                    f.writeBytes(xlsxBytes)
+                    f.absolutePath
+                }.getOrNull()
+            } else null
 
             val r = AlgorithmApi.exportZip(parsed.events, finalMap, finalUnmatched,
                 photoById::get, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles) { frac, _ ->
                 _state.update { it.copy(exportProgress = 0.6f + 0.4f * frac) }
             }
-            if (r.copied > 0 || r.failed > 0) {
-                copyToOutput(tmpZip, fileName).also { tmpZip.delete() }
-            }
+            // ★ 2026-10-18 P0-2：copyToOutput 返回 null = 输出目录不可写，结果里需提示；
+            //   tmpZip 无论是否复制统一清理（断点续传跳过时也会残留空文件）。
+            val shown = if (r.copied > 0 || r.failed > 0) copyToOutput(tmpZip, fileName) else null
+            runCatching { tmpZip.delete() }
             val skipNote = if (r.skippedFromState > 0) "（跳过已完成 ${r.skippedFromState}）" else ""
+            val writeNote = if (r.copied > 0 && shown == null) "（输出目录不可写）" else ""
+            // ★ 2026-10-18 P0-3：打包失败明细摘要（前 2 条 + 总数），让用户知道缺了哪些照片、为什么
+            val failNote = if (r.failedDetails.isNotEmpty()) {
+                val shown2 = r.failedDetails.take(2).joinToString("；")
+                val more = r.failedDetails.size - 2
+                " 失败[${shown2}${if (more > 0) " 等${r.failedDetails.size}条" else ""}]"
+            } else ""
             // ★ 2026-10-08 P0-1：Excel 生成结果附图片统计/失败明细，失败可诊断（不再静默降级）
             val xlsxNote = if (extraFiles.isNotEmpty()) {
                 val dbg = prep?.third.orEmpty()
@@ -686,11 +705,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             _state.update {
                 it.copy(
-                    exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}$skipNote$xlsxNote",
+                    exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}$failNote$skipNote$xlsxNote$writeNote",
                     exportProgress = null,
                     // ★ 回填台账行：底部操作条要显示「台账 N 行」，也需要它判断导出完成。
                     //   以前此处不回填，导致 state.ledger 永远为 null、底栏永远显示"台账待生成"。
                     ledger = prep?.first ?: it.ledger,
+                    // ★ 2026-10-18 P0-2：回填台账 xlsx 缓存路径（此前从未赋值 → 「打开台账」永远无响应）；
+                    //   台账失败时为 null → UI 不显示「打开台账」入口。
+                    lastExport = xlsxCachePath,
                 )
             }
         } catch (e: Exception) {
@@ -721,10 +743,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return f.outputStream() to f.absolutePath
     }
 
-    /** 把已生成的临时文件复制到输出目标（SAF 树或本地路径）。返回用户可见位置。 */
-    private fun copyToOutput(tmp: File, fileName: String): String {
+    /** 把已生成的临时文件复制到输出目标（SAF 树或本地路径）。返回用户可见位置；失败（目录不可写）返回 null。 */
+    private fun copyToOutput(tmp: File, fileName: String): String? {
         val (os, shown) = openOutputSink(fileName)
-        if (os == null) return "（输出目录不可写）"
+        if (os == null) return null
         os.use { out -> tmp.inputStream().use { it.copyTo(out) } }
         return shown
     }

@@ -1,5 +1,5 @@
 // algorithm/LedgerEngineTest.kt —— §7 台账模块测试（导出Excel 2.0 方案）
-// 契约：每事件一行 / 日期列 yyyy-MM-dd HH:mm（开始时间）/ 地点桩号优先 / 日志内容 /
+// 契约：每事件一行 / 日期列 yyyy-MM-dd HH:mm（开始时间）/ 结束时间列 yyyy-MM-dd HH:mm（单时间点留空）/ 地点桩号优先 / 日志内容 /
 //       照片1=第一张(最早)、照片2=最后一张(最晚)——可用人工标记覆盖，未标记侧回退默认；
 //       无拍摄时间的照片不参与最早/最晚选择 / 按 endTime 排序
 package algorithm
@@ -28,12 +28,22 @@ class LedgerEngineTest {
         val e = ev(1, at(10, 5), at(10, 30))
         val rows = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()))
         assertEquals("2026-09-03 10:05", rows[0].dateTime)
+        assertEquals("2026-09-03 10:30", rows[0].endTime, "结束时间列=事件结束时间")
     }
 
     @Test fun `无开始时间日期列为空`() {
         val e = ev(1, null, null)
         val rows = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()))
         assertEquals("", rows[0].dateTime)
+        assertEquals("", rows[0].endTime, "无结束时间时结束时间列为空")
+    }
+
+    @Test fun `单时间点事件结束时间为空`() {
+        // 单时间点事件 endTimeMs == startTimeMs：结束时间列留空，避免 "08:30 ~ 08:30" 冗余
+        val e = ev(1, at(10, 5), at(10, 5))
+        val rows = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()))
+        assertEquals("2026-09-03 10:05", rows[0].dateTime)
+        assertEquals("", rows[0].endTime)
     }
 
     @Test fun `照片默认取最早和最晚各一张`() {
@@ -77,10 +87,20 @@ class LedgerEngineTest {
     }
 
     @Test fun `跨日事件日期按实际开始日期`() {
-        // 09-03 23:30 开始，09-04 01:00 结束 → 日期列显示 09-03 23:30
+        // 09-03 23:30 开始，09-04 01:00 结束 → 日期列显示 09-03 23:30，结束时间显示 09-04 01:00
         val e = ev(1, atDate(3, 23, 30), atDate(4, 1, 0))
         val rows = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()))
         assertEquals("2026-09-03 23:30", rows[0].dateTime)
+        assertEquals("2026-09-04 01:00", rows[0].endTime, "跨日事件结束时间按实际日期+1")
+    }
+
+    @Test fun `folderName与ZIP文件夹命名一致`() {
+        // 回归 P1-3/P2-4：namingTemplate=0 → 事件类型；=1 → 月日+日志内容；均带序号前缀（与 ZipExporter 同规则）
+        val e = ev(1, at(10, 5), at(10, 30), type = "交通事故处置")
+        val rows0 = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()), namingTemplate = 0)
+        assertEquals("01_交通事故处置", rows0[0].folderName)
+        val rows1 = engine.buildLedger(listOf(e), emptyMap(), byId(emptyList()), namingTemplate = 1)
+        assertEquals("01_0903_描述1", rows1[0].folderName)
     }
 
     // ──────────────────────────────────────────────────────────────

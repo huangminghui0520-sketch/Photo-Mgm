@@ -1,29 +1,36 @@
 // algorithm/XlsxWriter.kt —— §7.3 Excel 写入（纯 Kotlin，零第三方依赖，可移植 PC）
-// ★ 导出Excel 2.0 方案：6 列（序号/日期/地点/日志内容/照片1/照片2），列宽 A8 B18 C24 D60 E20 F20，
-//   表头行高 25、数据行高动态（随日志内容长度），日志内容列自动换行，照片以缩略图嵌入。
+// ★ 导出Excel 2.0 方案：7 列（序号/日期/结束时间/地点/日志内容/照片1/照片2），
+//   列宽 A8 B18 C18 D24 E60 F22 G22，表头行高 25、数据行高动态（随日志内容长度），
+//   日志内容列自动换行，照片以缩略图嵌入。
+// ★ 2026-10-18 P1-1：新增"结束时间"列（C 列）；照片列由 E/F 移至 F/G（0-based 5/6）。
 // ★ 照片嵌入：imageLoader(ref) 返回图片字节（JPEG/PNG），自动生成 drawing + media + rels；
-//   图片锚定到照片1/照片2 所在单元格（E/F 列 × 1 行显示区）。无图片或加载失败 → 照片列仅写文件名。
+//   图片锚定到照片1/照片2 所在单元格（F/G 列 × 1 行显示区）。无图片或加载失败 → 照片列仅写文件名。
 package algorithm
 
 import algorithm.model.LedgerRow
 import java.io.OutputStream
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 object XlsxWriter {
-    /** 表头（导出Excel 2.0 方案 §2.1） */
-    val HEADERS: List<String> = listOf("序号", "日期", "地点", "日志内容", "照片1", "照片2")
+    /** 表头（导出Excel 2.0 方案 §2.1；2026-10-18 P1-1 新增"结束时间"） */
+    val HEADERS: List<String> = listOf("序号", "日期", "结束时间", "地点", "日志内容", "照片1", "照片2")
 
-    /** 列宽（字符）：A:8, B:18, C:24, D:60, E:22, F:22
-     *  ★ 2026-10-08 修复照片与单元格不匹配：E/F 照片列 20 → 22，
-     *    容纳固定宽 3.81cm 的嵌入照片（20 字符在 Excel/WPS 换算下仅 ≈3.7cm，横向溢出）。 */
-    private val COL_WIDTHS: List<Int> = listOf(8, 18, 24, 60, 22, 22)
+    /** 列宽（字符）：A:8, B:18, C:18, D:24, E:60, F:22, G:22
+     *  ★ 2026-10-08 修复照片与单元格不匹配：照片列 20 → 22，
+     *    容纳固定宽 3.81cm 的嵌入照片（20 字符在 Excel/WPS 换算下仅 ≈3.7cm，横向溢出）。
+     *  ★ 2026-10-18 P1-1：C=结束时间 18（"yyyy-MM-dd HH:mm"≈16 字符），D=地点 24。 */
+    private val COL_WIDTHS: List<Int> = listOf(8, 18, 18, 24, 60, 22, 22)
 
     /** 表头行高 / 数据行最小行高（磅）。数据行高随日志内容动态计算，避免长文本撑高行导致照片错位。 */
     private const val HEADER_ROW_H = 25
     private const val DATA_ROW_H_MIN = 81
 
-    /** D列（日志内容）列宽 60 字符；估算每行可容纳约 30 个中文字符（11pt 字体）。 */
+    /** E列（日志内容）列宽 60 字符；估算每行可容纳约 30 个中文字符（11pt 字体）。 */
     private const val CHARS_PER_LINE = 30
     /** 每行文本约 16 磅 + 上下边距 8 磅。 */
     private const val LINE_HEIGHT_PT = 16
@@ -31,7 +38,7 @@ object XlsxWriter {
 
     /** 数据行的单元格：区分数字与文本，避免把所有内容都塞进 inlineStr。 */
     private sealed interface Cell {
-        /** styled=true 时套用 s="1"（wrapText），目前仅 D 列日志内容使用。 */
+        /** styled=true 时套用 s="1"（wrapText），目前仅 E 列日志内容使用。 */
         val styled: Boolean
 
         /** 数字单元格（无 t 属性，Excel 按数值处理）。 */
@@ -39,6 +46,9 @@ object XlsxWriter {
 
         /** 文本单元格（inlineStr，xml:space="preserve" 保留空白与换行）。 */
         data class Str(val value: String, override val styled: Boolean = false) : Cell
+
+        /** 真实日期单元格（P2-2）：值=Excel 1900 序列号，固定套日期格式样式 s=$DATE_FMT_STYLE。 */
+        data class DateTime(val serial: Double, override val styled: Boolean = false) : Cell
     }
 
     /** 根据日志内容长度动态计算行高：至少容纳照片(81磅)，长文本按行数增加，避免 Excel 自动撑高导致照片错位。
@@ -71,9 +81,12 @@ object XlsxWriter {
         return maxOf(DATA_ROW_H_MIN, textHeight.toInt())
     }
 
-    /** 图片锚定：照片1 列=4、照片2 列=5（0-based E/F）；显示 1 列 × 1 行。 */
-    private const val COL_P1 = 4
-    private const val COL_P2 = 5
+    /** 图片锚定：照片1 列=5、照片2 列=6（0-based F/G）；显示 1 列 × 1 行。 */
+    private const val COL_P1 = 5
+    private const val COL_P2 = 6
+
+    /** 日期时间样式在 styles.xml cellXfs 中的索引（P2-2，numFmtId=164 "yyyy-mm-dd hh:mm"）。 */
+    private const val DATE_FMT_STYLE = 2
 
     /** 把台账行写入 xlsx 字节流（ZIP 容器 + OOXML 部件）。imageLoader 返回照片字节（可为 null）。 */
     fun write(rows: List<LedgerRow>, out: OutputStream, imageLoader: (String?) -> ByteArray? = { null }) {
@@ -146,7 +159,7 @@ object XlsxWriter {
         val sb = StringBuilder()
         sb.append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         sb.append("""<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">""")
-        // 列宽（导出Excel 2.0 方案：A:8 B:18 C:24 D:60 E:20 F:20）
+        // 列宽（导出Excel 2.0 方案：A:8 B:18 C:18 D:24 E:60 F:22 G:22）
         sb.append("<cols>")
         COL_WIDTHS.forEachIndexed { i, w ->
             val min = i + 1
@@ -160,11 +173,12 @@ object XlsxWriter {
             sb.append(dataRowXml(i + 2, listOf(
                 // 序号用数字单元格（不是文本）：否则 Excel 报"数字以文本存储"且无法求和排序
                 Cell.Number((i + 1).toString()),
-                Cell.Str(r.dateTime),
+                dateCell(r.dateTime),                       // B 列：真实日期（P2-2），失败回退文本
+                dateCell(r.endTime),                        // C 列：真实日期（P2-2），失败回退文本
                 Cell.Str(r.location),
-                Cell.Str(r.description, styled = true),   // D 列 wrapText
-                Cell.Str(fileName(r.photo1Ref).orEmpty()),
-                Cell.Str(fileName(r.photo2Ref).orEmpty()),
+                Cell.Str(r.description, styled = true),   // E 列 wrapText
+                Cell.Str(photoLabel(r, r.photo1Ref)),
+                Cell.Str(photoLabel(r, r.photo2Ref)),
             ), rowH))
         }
         sb.append("</sheetData>")
@@ -184,7 +198,7 @@ object XlsxWriter {
         return sb.toString()
     }
 
-    /** 数据行：行高动态计算（随日志内容长度）；日志内容列（D，索引 3）应用 wrapText 样式（s="1"）。 */
+    /** 数据行：行高动态计算（随日志内容长度）；日志内容列（E，索引 4）应用 wrapText 样式（s="1"）。 */
     private fun dataRowXml(r: Int, cells: List<Cell>, rowHeight: Int): String {
         val sb = StringBuilder("""<row r="$r" ht="$rowHeight" customHeight="1">""")
         cells.forEachIndexed { i, cell ->
@@ -193,6 +207,9 @@ object XlsxWriter {
             when (cell) {
                 is Cell.Number ->
                     sb.append("""<c r="$col$r"$style><v>${cell.value}</v></c>""")
+                is Cell.DateTime ->
+                    // 真实日期：值=序列号，固定套日期格式样式（Excel/WPS 据此显示为 yyyy-mm-dd hh:mm）
+                    sb.append("""<c r="$col$r" s="$DATE_FMT_STYLE"><v>${cell.serial}</v></c>""")
                 is Cell.Str ->
                     sb.append(
                         """<c r="$col$r"$style t="inlineStr"><is><t xml:space="preserve">""" +
@@ -207,6 +224,35 @@ object XlsxWriter {
     /** 照片列写文件名（sourceRef 最后一段，§7.3）；null → 空单元格。 */
     fun fileName(ref: String?): String? =
         ref?.substringAfterLast('/')?.substringAfterLast('\\')
+
+    // ---------- 真实日期（P2-2：B/C 列可排序、可筛选） ----------
+
+    /** 台账日期文本格式（与 LedgerEngine.formatDateTime/formatEndTime 输出一致）。 */
+    private val DT_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+    /** 严格解析台账日期文本；空串或异常格式返回 null（调用方回退为文本单元格）。 */
+    private fun parseDateTime(s: String): LocalDateTime? =
+        if (s.isBlank()) null else try {
+            LocalDateTime.parse(s, DT_FMT)
+        } catch (_: Exception) {
+            null
+        }
+
+    /** Excel 1900 日期系统序列号 = 自 1899-12-30 起天数 + 当日秒数/86400（标准公式，兼容 Excel 闰年偏移）。 */
+    private fun toExcelSerial(dt: LocalDateTime): Double =
+        ChronoUnit.DAYS.between(LocalDate.of(1899, 12, 30), dt.toLocalDate()).toDouble() +
+                (dt.hour * 3600 + dt.minute * 60) / 86400.0
+
+    /** 日期列单元格：可解析为 yyyy-MM-dd HH:mm → 真实日期类型；否则（空/异常）回退文本，保底不报错。 */
+    private fun dateCell(s: String): Cell =
+        parseDateTime(s)?.let { Cell.DateTime(toExcelSerial(it)) } ?: Cell.Str(s)
+
+    /** ★ 2026-10-18 P1-3：照片列文本 = "文件夹名/文件名"，消除 ZIP 内跨事件文件夹同名歧义；
+     *  无文件夹名（旧调用/直接构造 LedgerRow）时仅写文件名，行为与改造前一致。 */
+    private fun photoLabel(r: LedgerRow, ref: String?): String {
+        val f = fileName(ref) ?: return ""
+        return if (r.folderName.isNotBlank()) "${r.folderName}/$f" else f
+    }
 
     /**
      * 图片锚定：oneCellAnchor + 固定尺寸（EMU）。
@@ -298,9 +344,9 @@ object XlsxWriter {
         <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDraw1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>
     """.trimIndent()
 
-    /** 样式：0=默认；1=wrapText（日志内容列 D 自动换行，垂直顶端对齐）。 */
+    /** 样式：0=默认；1=wrapText（日志内容列 E 自动换行，垂直顶端对齐）；2=日期时间 numFmt 164（yyyy-mm-dd hh:mm，P2-2）。 */
     private val STYLES = """
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-        <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs></styleSheet>
+        <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm"/></numFmts><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>
     """.trimIndent()
 }

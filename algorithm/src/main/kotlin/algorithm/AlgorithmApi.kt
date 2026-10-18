@@ -34,14 +34,16 @@ object AlgorithmApi {
         backfillMs: Long = EventClassifyEngine.DEFAULT_BACKFILL_MS,
     ): ClassifyResult = EventClassifyEngine(maxDistanceM).classify(events, clusters, singles, patrolDate, splitCount, backfillMs)
 
-    /** 台账生成（§7）：事件 + 分类结果 → 每事件一行（日期/地点/日志内容/照片第一张+最后一张）。
-     *  @param marked 人工台账标记：eventId -> (照片1, 照片2)；某一侧为 null 表示该侧用默认（最早/最晚） */
+    /** 台账生成（§7）：事件 + 分类结果 → 每事件一行（日期/结束时间/地点/日志内容/照片第一张+最后一张）。
+     *  @param marked 人工台账标记：eventId -> (照片1, 照片2)；某一侧为 null 表示该侧用默认（最早/最晚）
+     *  @param namingTemplate 事件文件夹命名模板（P1-3：照片列"文件夹名/文件名"前缀，与 ZIP 分类一致） */
     fun buildLedger(
         events: List<LogEvent>,
         eventPhotoMap: Map<Int, List<Long>>,
         photoById: (Long) -> Photo?,
         marked: Map<Int, Pair<Long?, Long?>> = emptyMap(),
-    ): List<LedgerRow> = LedgerEngine().buildLedger(events, eventPhotoMap, photoById, marked)
+        namingTemplate: Int = 0,
+    ): List<LedgerRow> = LedgerEngine().buildLedger(events, eventPhotoMap, photoById, marked, namingTemplate)
 
     /** Excel 写入（§7.3）：LedgerRow → .xlsx 字节流（纯 Kotlin OOXML，可移植 PC）。
      *  @param imageLoader 照片引用 → 图片字节（JPEG/PNG），嵌入台账照片列；返回 null/缺省 则照片列仅写文件名。 */
