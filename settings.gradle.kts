@@ -1,10 +1,20 @@
 // Photo-Mgm 工程设置
-// 国内网络环境：所有远程仓库一律走阿里云镜像（优先），禁止 google()/mavenCentral()/gradlePluginPortal() 原生地址
+// 仓库源按环境切换（注：pluginManagement/dependencyResolutionManagement 块内不能引用脚本局部变量，
+// 故直接内联判断）：
+//   - 本地/国内：走阿里云镜像（默认，国内网络直连原生地址慢/不可达）
+//   - CI（GitHub Actions，自动注入 CI=true）：走 google()/mavenCentral()/gradlePluginPortal() 原生源，
+//     美国 runner 直连原生源又快又稳（阿里云镜像对海外访问不稳定，曾导致构建失败）
 pluginManagement {
     repositories {
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        if (System.getenv("CI") == "true") {
+            google()
+            mavenCentral()
+            gradlePluginPortal()
+        } else {
+            maven { url = uri("https://maven.aliyun.com/repository/public") }
+            maven { url = uri("https://maven.aliyun.com/repository/google") }
+            maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        }
         mavenLocal()
     }
 }
@@ -12,9 +22,13 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        if (System.getenv("CI") == "true") {
+            google()
+            mavenCentral()
+        } else {
+            maven { url = uri("https://maven.aliyun.com/repository/public") }
+            maven { url = uri("https://maven.aliyun.com/repository/google") }
+        }
         mavenLocal()
     }
 }
