@@ -1,41 +1,66 @@
-# Photo-Mgm · 高速公路巡查照片分类 App
+# Photo-Mgm・高速公路巡查照片分类 App
 
 面向路政巡查场景的照片分类工具：根据巡查日志（含时间、事件、地点），结合照片 GPS 与拍摄时间，自动将照片归类到对应巡查事件，并支持人工调整、台账导出与压缩包交付。
 
 ## 模块结构
 
-| 模块 | 职责 | 依赖 |
-|------|------|------|
-| `:algorithm` | 核心算法（纯 Kotlin JVM，零 Android 依赖，可移植 PC/飞牛OS） | 无 |
-| `:data` | Android 数据接入层（MediaStore / SAF / ExifInterface） | `:algorithm` |
-| `:app` | Android UI（Compose Material3，仅经 `AlgorithmApi` 单向调用核心） | `:algorithm`, `:data` |
+
+
+| 模块           | 职责                                                     | 依赖                    |
+| ------------ | ------------------------------------------------------ | --------------------- |
+| `:algorithm` | 核心算法（纯 Kotlin JVM，零 Android 依赖，可移植 PC / 飞牛 OS）         | 无                     |
+| `:data`      | Android 数据接入层（MediaStore / SAF / ExifInterface）        | `:algorithm`          |
+| `:app`       | Android UI（Compose Material3，仅经 `AlgorithmApi` 单向调用核心） | `:algorithm`, `:data` |
 
 ## 核心算法能力（:algorithm）
 
-- 日志解析：时间 / 地点（桩号+方向）/ 事件类型 / 巡查人员 / 车牌，黄金样本 `收费公路巡查日志`
-- GPS 分组：50 米内合并为一组，离群拆簇，跨日按完整时间戳
-- 事件分类：按日志时间窗口把照片归入事件（首条日志起点归属 / 后续终点归属），支持人工移动兜底
-- 台账生成：每事件一行（序号/日期/结束时间/地点/日志内容/照片1/照片2）导出 Excel（OOXML 手写，零第三方依赖）
-  - 日期列为 Excel 真实日期类型（`yyyy-mm-dd hh:mm` 格式），可直接排序、筛选
-  - 结束时间列：跨日事件按实际结束日期展示，单时间点事件留空
-  - 照片列显示「文件夹名/文件名」，跨文件夹同名照片可精确定位
-- 压缩包导出：按「事件类型」或「日期+事件类型+日志内容」建文件夹，照片 + 台账 Excel 打包 ZIP
-  - 文件夹按事件时间升序并加序号前缀（`01_`、`02_` …），未匹配照片统一归入 `99_未分类`
-  - 台账照片列前缀与 ZIP 内路径一致，解压后一一对应
+
+
+* 日志解析：时间 / 地点（桩号 + 方向）/ 事件类型 / 巡查人员 / 车牌，黄金样本 `收费公路巡查日志`
+
+* GPS 分组：50 米内合并为一组，离群拆簇，跨日按完整时间戳
+
+* 事件分类：按日志时间窗口把照片归入事件（首条日志起点归属 / 后续终点归属），支持人工移动兜底
+
+* 台账生成：每事件一行（序号 / 日期 / 结束时间 / 地点 / 日志内容 / 照片 1 / 照片 2）导出 Excel（OOXML 手写，零第三方依赖）
+
+
+  * 日期列为 Excel 真实日期类型（`yyyy-mm-dd hh:mm` 格式），可直接排序、筛选
+
+  * 结束时间列：跨日事件按实际结束日期展示，单时间点事件留空
+
+  * 照片列显示「文件夹名 / 文件名」，跨文件夹同名照片可精确定位
+
+* 压缩包导出：按「事件类型」或「日期 + 事件类型 + 日志内容」建文件夹，照片 + 台账 Excel 打包 ZIP
+
+
+  * 文件夹按事件时间升序并加序号前缀（`01_`、`02_` …），未匹配照片统一归入 `99_未分类`
+
+  * 台账照片列前缀与 ZIP 内路径一致，解压后一一对应
 
 ## 导出台账可靠性
 
-- 断点续传：重复导出同一批照片且内容未变化时跳过已完成任务，不重复打包
-- 失败明细：导出失败时在结果提示中列出失败照片（ZIP 内路径 + 原因），便于定位
-- 打开台账：导出完成后可直接一键打开生成的 Excel 台账文件
+
+
+* 断点续传：重复导出同一批照片且内容未变化时跳过已完成任务，不重复打包
+
+* 失败明细：导出失败时在结果提示中列出失败照片（ZIP 内路径 + 原因），便于定位
+
+* 打开台账：导出完成后可直接一键打开生成的 Excel 台账文件
 
 ## 构建
 
 远程仓库按环境自动切换：
-- 本地（国内网络）：阿里云镜像，wrapper 发行包走腾讯云镜像，无需额外配置
-- CI（GitHub Actions，自动注入 `CI=true`）：`google()` / `mavenCentral()` 原生源，避免海外 runner 访问国内镜像超时
 
-```bash
+
+
+* 本地（国内网络）：阿里云镜像，wrapper 发行包走腾讯云镜像，无需额外配置
+
+* CI（GitHub Actions，自动注入 `CI=true`）：`google()` / `mavenCentral()` 原生源，避免海外 runner 访问国内镜像超时
+
+
+
+```
 # 单元测试（algorithm 254 用例）
 gradle :algorithm:test
 
@@ -46,23 +71,40 @@ gradle :app:assembleRelease
 
 产物：`app/build/outputs/apk/debug/app-debug.apk` 或 `app/build/outputs/apk/release/app-release.apk`
 
-> 正式签名：release 构建会读取本地 `keystore/keystore.properties`（不入库）；缺失时回退 debug 签名，保证任何环境可构建。
+> 正式签名：release 构建会读取本地 
+>
+> `keystore/keystore.properties`
+>
+> （不入库）；缺失时回退 debug 签名，保证任何环境可构建。
 
 ## 使用
 
+
+
 1. 设置：选择照片源目录（SAF 系统选择器）、输出目录、巡查日期与命名模板
+
 2. 解析：导入巡查日志文本，自动解析事件并分类照片，可在预览页人工调整
+
 3. 导出：一键导出压缩包（照片 + 台账 Excel），完成后可打开台账核对
 
 ## 持续集成（GitHub Actions）
 
-- 推送 `main` 自动构建 release APK，并发布预发布版（`auto-*` 标签）
-- 推送 `v*` 标签（如 `v1.0.0`）自动构建并发布正式版
-- 同一分支只保留最新构建，自动取消旧的运行中任务
+
+
+* 推送 `main` 自动构建 release APK，并发布预发布版（`auto-*` 标签）
+
+* 推送 `v*` 标签（如 `v1.0.0`）自动构建并发布正式版
+
+* 同一分支只保留最新构建，自动取消旧的运行中任务
 
 ## 技术栈
 
-- Kotlin 2.0.21 · AGP 8.7.3 · Gradle 8.10.2（wrapper 走腾讯云镜像）
-- Jetpack Compose Material3 · Coil · SharedPreferences 持久化
-- Android minSdk 26 / targetSdk 34 · Java 17
-- 当前版本：1.3.0-fused（versionCode 4）
+
+
+* Kotlin 2.0.21・AGP 8.7.3・Gradle 8.10.2（wrapper 走腾讯云镜像）
+
+* Jetpack Compose Material3・Coil・SharedPreferences 持久化
+
+* Android minSdk 26 / targetSdk 34 · Java 17
+
+* 当前版本：1.3.0-fused（versionCode 4）
