@@ -198,24 +198,143 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
     }
 
     private fun sanitize(name: String): String =
-        name.replace(Regex("""[\\/:*?"<>|]"""), "_")
+        name.replace(Regex("""[\\\/:*?\"<>|]"""), "_")
 
     private fun readCompleted(f: File?): Completed? {
         if (f == null || !f.isFile) return null
         val raw = f.readText()
-        val m = Regex(""""completed":\s*\[(.*?)\]""").find(raw) ?: return Completed(emptySet(), false)
-        val paths = m.groupValues[1].split(',').map { it.trim().trim('"') }.filter { it.isNotEmpty() }.toSet()
-        // 旧格式 state 无 extra 字段：保守按"带台账"处理（不跳过），避免台账失败时误跳过。
-        val withLedger = !Regex(""""extra":\s*false""").containsMatchIn(raw)
-        return Completed(paths, withLedger)
+        val decoded = StateJson.decode(raw) ?: return Completed(emptySet(), false)
+        return Completed(decoded.first, decoded.second)
     }
 
     private fun writeCompleted(f: File?, paths: Set<String>, withLedger: Boolean) {
         if (f == null) return
-        val joined = paths.joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" }
-        val json = "{\"completed\":[$joined],\"extra\":${if (withLedger) "true" else "false"}}"
         f.parentFile?.mkdirs()
-        f.writeText(json)
+        f.writeText(StateJson.encode(paths, withLedger))
+    }
+
+    /**
+     * ★ 2026-10-24 P2-3：断点续传状态文件的 JSON 编解码（替代原手写正则解析）。
+     *
+     * 原实现 `"completed":\s*\[(.*?)\]` + 按 `,` split：路径含 `]`（正则提前截断）、
+     * 含 `,`（split 拆碎）、含 `"`（转义不完整）时解析失真 → 断点续传误判集合不等而失效。
+     * 本实现做标准 JSON 字符串/布尔解析（完整转义），自包含零依赖（algorithm 保持 JVM 可移植）。
+     *
+     * 兼容性：旧格式 `{"completed":[...]}` 无 extra 字段 → 保守按"带台账"（withLedger=true，不跳过），
+     * 与既有 P0-1 语义一致。
+     */
+    private object StateJson {
+        fun encode(completed: Set<String>, extra: Boolean): String {
+            val sb = StringBuilder("{\"completed\":[")
+            completed.forEachIndexed { i, p ->
+                if (i > 0) sb.append(',')
+                sb.append(quote(p))
+            }
+            sb.append("],\"extra\":").append(extra).append('}')
+            return sb.toString()
+        }
+
+        /** 解析 {"completed":[...],"extra":bool}；无 completed 键 → null；无 extra 键 → 保守按 true（不跳过）。 */
+        fun decode(raw: String): Pair<Set<String>, Boolean>? {
+            var completed: Set<String>? = null
+            var extra: Boolean? = null
+            var i = 0
+            while (i < raw.length) {
+                if (raw[i] != '"') { i++; continue }
+                val key = parseString(raw, i) ?: return null
+                i = key.second
+                var j = skipWs(raw, i)
+                if (j >= raw.length || raw[j] != ':') continue
+                j = skipWs(raw, j + 1)
+                when (key.first) {
+                    "completed" -> {
+                        if (j >= raw.length || raw[j] != '[') return null
+                        val list = mutableListOf<String>()
+                        var m = j + 1
+                        while (true) {
+                            m = skipWs(raw, m)
+                            if (m >= raw.length) return null
+                            if (raw[m] == ']') { m++; break }
+                            if (raw[m] != '"') return null
+                            val v = parseString(raw, m) ?: return null
+                            list.add(v.first)
+                            m = skipWs(raw, v.second)
+                            if (m >= raw.length) return null
+                            if (raw[m] == ',') { m++; continue }
+                            if (raw[m] == ']') { m++; break }
+                            return null
+                        }
+                        completed = list.toSet()
+                        i = m
+                    }
+                    "extra" -> {
+                        if (raw.startsWith("true", j)) { extra = true; i = j + 4 }
+                        else if (raw.startsWith("false", j)) { extra = false; i = j + 5 }
+                        else return null
+                    }
+                    else -> i = key.second
+                }
+            }
+            val c = completed ?: return null
+            return c to (extra ?: true)   // 旧格式无 extra → 保守按"带台账"（不跳过）
+        }
+
+        private fun skipWs(raw: String, from: Int): Int {
+            var i = from
+            while (i < raw.length && raw[i].isWhitespace()) i++
+            return i
+        }
+
+        /** JSON 字符串字面量编码（完整转义：引号/反斜杠/控制字符）。 */
+        private fun quote(s: String): String = buildString {
+            append('"')
+            for (c in s) when (c) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
+            }
+            append('"')
+        }
+
+        /** 解析 JSON 字符串字面量（含完整转义）；返回 (值, 结束引号后位置)。 */
+        private fun parseString(raw: String, from: Int): Pair<String, Int>? {
+            if (from >= raw.length || raw[from] != '"') return null
+            val sb = StringBuilder()
+            var i = from + 1
+            while (i < raw.length) {
+                when (val c = raw[i]) {
+                    '"' -> return sb.toString() to (i + 1)
+                    '\\' -> {
+                        if (i + 1 >= raw.length) return null
+                        when (val e = raw[i + 1]) {
+                            '"' -> sb.append('"')
+                            '\\' -> sb.append('\\')
+                            '/' -> sb.append('/')
+                            'b' -> sb.append('\b')
+                            'f' -> sb.append('\u000C')
+                            'n' -> sb.append('\n')
+                            'r' -> sb.append('\r')
+                            't' -> sb.append('\t')
+                            'u' -> {
+                                if (i + 5 >= raw.length) return null
+                                val code = raw.substring(i + 2, i + 6).toIntOrNull(16) ?: return null
+                                sb.append(code.toChar())
+                                i += 4
+                            }
+                            else -> return null
+                        }
+                        i += 2
+                    }
+                    else -> { sb.append(c); i++ }
+                }
+            }
+            return null
+        }
     }
 
     private companion object {
@@ -224,6 +343,6 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
         /** 未匹配照片的固定文件夹（P2-4：99_ 前缀保证按名称排序时始终最后）。 */
         const val UNMATCHED_FOLDER = "99_未分类"
         /** 开头时间前缀：上午/下午可选 + 时点 + 可选"至终点" + 尾随空格 */
-        val LEADING_TIME_RE = Regex("""^(?:上午|下午)?\d{1,2}[点时:：]\d{0,2}(?:分)?(?:至\d{1,2}[点时:：]\d{0,2}(?:分)?)?\s*""")
+        val LEADING_TIME_RE = Regex("""^(?:上午|下午)?\\d{1,2}[点时:：]\\d{0,2}(?:分)?(?:至\\d{1,2}[点时:：]\\d{0,2}(?:分)?)?\\s*""")
     }
 }

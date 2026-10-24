@@ -116,4 +116,4 @@ gradle :app:assembleRelease
 
 * Android minSdk 26 / targetSdk 34 · Java 17
 
-* 当前版本：1.3.1（versionCode 5）
+* 当前版本：1.3.2（versionCode 6）
