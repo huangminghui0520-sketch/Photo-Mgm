@@ -1,0 +1,190 @@
+// algorithm/Dedup.kt —— 重复照片三态保留（2026-10-24 B1）
+// 使用场景：一日巡查中，水印相机事件同时产出「带水印主图 IMG_xxx.jpg + 无水印 _original」双份（文件名数字相邻、
+//           EXIF 同刻同 GPS）；手机自带相机事件仅单份无水印。
+// 设计：分类阶段照旧全量照片（不提前删除）；输出层对「已分类事件的重复照片组」做三态动态分类
+//       （带水印 / 不带水印 / 都保留）；未匹配照片不参与、全量保留；人工标记（keepAlways）优先。
+// 扩展位：PhotoDedupStrategy 接口 —— 后续可追加哈希判重 / 水印识别等实现，管线不改。
+package algorithm
+
+import algorithm.model.Photo
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/** 重复照片保留策略（用户三选一）。 */
+enum class DedupKeepMode {
+    /** 仅保留带水印（默认）：水印相机主图 IMG_xxx.jpg（无派生后缀）。 */
+    KEEP_WATERMARKED,
+
+    /** 仅保留不带水印：_original 备份。 */
+    KEEP_PLAIN,
+
+    /** 两者都保留：不去重（等同现状）。 */
+    KEEP_BOTH,
+}
+
+/** 重复照片判重配置（默认：时间容差 1s + GPS 距离 10m + 降级序号容差 1000）。 */
+data class DedupConfig(
+    val timeToleranceMs: Long = 1_000L,
+    val gpsToleranceM: Double = 10.0,
+    /** ★ 2026-10-24 降级判重：双方 GPS 均无效（缺失/清零）时，文件名最后数字块（拍摄毫秒序号）容差。 */
+    val seqTolerance: Long = 1_000L,
+)
+
+/**
+ * 照片去重策略（预留扩展位）。
+ * 本期实现 [ExifContentDedupStrategy]（时间+GPS）；后续可追加 HashDedupStrategy / WatermarkDedupStrategy。
+ */
+interface PhotoDedupStrategy {
+    /** 判定两张照片是否视为同一张（同一内容 / 同一瞬间）。 */
+    fun isSame(a: Photo, b: Photo): Boolean
+
+    /** 同组多张中选出代表照片（用于组内保序 / 优先展示），默认主图（无派生后缀）优先。 */
+    fun retain(photos: List<Photo>): Photo =
+        photos.minByOrNull { derivedScore(it.displayName) } ?: photos.first()
+}
+
+/**
+ * 本期实现：拍摄时间（容差）+ GPS 距离（阈值）内容判重；
+ * ★ 2026-10-24 降级：双方 GPS 均无效（缺失或被 ROM 相册清零为 0/1,0/1,0/1）时，
+ *   自动降级为「时间 + 派生后缀 + 文件名毫秒序号」判重，保证真机（GPS 被系统脱敏）三态仍生效。
+ */
+class ExifContentDedupStrategy(
+    private val timeToleranceMs: Long = 1_000L,
+    private val gpsToleranceM: Double = 10.0,
+    private val seqTolerance: Long = 1_000L,
+) : PhotoDedupStrategy {
+    override fun isSame(a: Photo, b: Photo): Boolean {
+        val ta = a.captureTimeMs ?: return false
+        val tb = b.captureTimeMs ?: return false
+        if (abs(ta - tb) > timeToleranceMs) return false
+        // ── GPS 判重：任一方有有效 GPS → 维持原逻辑（时间 + GPS 距离）──
+        val (latA, lngA) = a.latitude to a.longitude
+        val (latB, lngB) = b.latitude to b.longitude
+        val gpsAOk = latA != null && lngA != null && !isZeroGps(latA, lngA)
+        val gpsBOk = latB != null && lngB != null && !isZeroGps(latB, lngB)
+        if (gpsAOk || gpsBOk) {
+            // 一方有有效 GPS、另一方无 → 不成组（保守：不把"有定位/无定位"的照片当双份）
+            if (!gpsAOk || !gpsBOk) return false
+            return haversineM(latA, lngA, latB, lngB) <= gpsToleranceM
+        }
+        // ── ★ 降级判重：双方 GPS 均无效（缺失/清零）──
+        //   todayCam 双份：IMG_...478.jpg（带水印主图）↔ IMG_...479_original.jpg（原图），
+        //   文件名最后数字块 = 拍摄毫秒序号，双份差 ∈ {1,2,956–959} 全 ≤ 1000；
+        //   任一方含派生后缀才允许成组（手机自带相机照片无派生后缀，永不误并）。
+        if (!isDerivedName(a.displayName) && !isDerivedName(b.displayName)) return false
+        val seqA = lastNumberBlock(a.displayName) ?: return false
+        val seqB = lastNumberBlock(b.displayName) ?: return false
+        return abs(seqA - seqB) <= seqTolerance
+    }
+}
+
+/** GPS 是否被清零（ROM 相册隐私脱敏的典型值：0/1,0/1,0/1 → 0.0,0.0）。 */
+internal fun isZeroGps(lat: Double, lng: Double): Boolean = lat == 0.0 && lng == 0.0
+
+/** 文件名最后一个数字块（todayCam 文件名末段 = 拍摄毫秒序号），无数字则 null。 */
+internal fun lastNumberBlock(name: String): Long? {
+    var last: MatchResult? = null
+    for (m in Regex("\\d+").findAll(name)) last = m
+    return last?.value?.toLongOrNull()
+}
+
+/** 两坐标点球面距离（米）。 */
+internal fun haversineM(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+    val R = 6371000.0
+    val dLat = Math.toRadians(lat2 - lat1)
+    val dLng = Math.toRadians(lng2 - lng1)
+    val h = sin(dLat / 2) * sin(dLat / 2) +
+        cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLng / 2) * sin(dLng / 2)
+    return R * 2 * atan2(sqrt(h), sqrt(1 - h))
+}
+
+/** 是否为派生文件（_original/_compressed 等），用于区分「带水印主图」与「无水印备份」。 */
+internal fun isDerivedName(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower.contains("_original") || lower.contains("_compressed") || lower.contains("_edited") ||
+        lower.contains("_modified") || lower.contains("_optimized") || lower.contains("_resized") ||
+        lower.contains("_缩略") || lower.contains("_压缩") || lower.contains("_原图")
+}
+
+/** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2（与 dedupDerived 保持一致）。 */
+internal fun derivedScore(name: String): Int {
+    val lower = name.lowercase()
+    var s = 0
+    if (lower.contains("_original")) s += 1
+    if (lower.contains("_compressed")) s += 2
+    return s
+}
+
+/**
+ * 内容判重分组（仅标记、不删除）：全量照片按「时间容差 + GPS 距离阈值」两两合并为重复组。
+ * @return 代表 id -> 组内其他照片（代表 = 组内 derivedScore 最小，即带水印主图优先）；
+ *         单份照片不进入结果。
+ *
+ * ★ 2026-10-24 修复（真实数据验证发现）：禁止链式传递合并。
+ *   并查集强制等价传递（A≈B、B≈C ⇒ A、B、C 同组）会把"相邻两个瞬间各自的双份"误并成 4 张一组，
+ *   导致仅保留带水印时误删另一瞬间的真实照片（15:37 过车涵洞实测被并组）。
+ *   改为「新照片须与组内**每一张**都满足判重才入组」——1s 容差下同一瞬间的 2 张双份可合并，
+ *   相邻瞬间（间隔 >1s）不会跨组合并。
+ *
+ * 复杂度 O(n²·组大小)（106 张约万次级距离计算，毫秒级），规模大时再换空间索引。
+ */
+fun PhotoIngest.groupDupContent(
+    photos: List<Photo>,
+    config: DedupConfig = DedupConfig(),
+    strategy: PhotoDedupStrategy = ExifContentDedupStrategy(config.timeToleranceMs, config.gpsToleranceM, config.seqTolerance),
+): Map<Long, List<Photo>> {
+    if (photos.size < 2) return emptyMap()
+    // 聚类：新照片只并入"与组内每张都重复"的组（防止 1s 容差链式传递）
+    val groups = ArrayList<MutableList<Photo>>()
+    for (p in photos) {
+        var placed = false
+        for (g in groups) {
+            if (g.all { strategy.isSame(it, p) }) {
+                g.add(p)
+                placed = true
+                break
+            }
+        }
+        if (!placed) groups.add(mutableListOf(p))
+    }
+    val out = LinkedHashMap<Long, List<Photo>>()
+    for (members in groups) {
+        if (members.size < 2) continue
+        val rep = strategy.retain(members)
+        out[rep.id] = members.filter { it.id != rep.id }
+    }
+    return out
+}
+
+/**
+ * 事件照片三态展开（仅作用于已分类事件照片；未匹配照片不调用本函数、全量保留）。
+ * @param keepAlways 强制保留的 id（人工标记优先，跳过三态过滤）。
+ * @return 展开后的照片 id 列表（保序、去重）。
+ */
+fun PhotoIngest.expandForKeepMode(
+    photoIds: List<Long>,
+    dupGroups: Map<Long, List<Photo>>,
+    keepMode: DedupKeepMode,
+    keepAlways: Set<Long> = emptySet(),
+): List<Long> {
+    if (keepMode == DedupKeepMode.KEEP_BOTH) return photoIds
+    // 组内每个成员 id -> 应保留的版本 id
+    val preferred = HashMap<Long, Long>()
+    for ((repId, dupList) in dupGroups) {
+        val chosen = when (keepMode) {
+            DedupKeepMode.KEEP_WATERMARKED -> repId
+            DedupKeepMode.KEEP_PLAIN -> dupList.firstOrNull { isDerivedName(it.displayName) }?.id ?: repId
+            DedupKeepMode.KEEP_BOTH -> repId // 不可达（上方已返回）
+        }
+        preferred[repId] = chosen
+        for (d in dupList) preferred[d.id] = chosen
+    }
+    val out = LinkedHashSet<Long>()
+    for (id in photoIds) {
+        out.add(if (id in keepAlways) id else preferred[id] ?: id)
+    }
+    return out.toList()
+}
