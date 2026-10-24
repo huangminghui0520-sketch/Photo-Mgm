@@ -136,6 +136,19 @@ class DedupKeepModeTest {
     }
 
     @Test
+    fun `不带水印模式 同组含original与compressed 优先选original`() {
+        // 回归 P3-6：组内既有 _original（无水印原图，语义优先）又有 _compressed（压缩副本）时，
+        // 必须按派生分数选 _original（原实现取"列表顺序第一个派生"，_compressed 排在前面时会选错）。
+        // 构造 dupList 顺序 = [compressed, original]，旧实现 firstOrNull 会选中 compressed。
+        val dup = mapOf(1L to listOf(
+            photo(3, "IMG_20261024_084736480_compressed.jpg", t0),
+            photo(2, "IMG_20261024_084736479_original.jpg", t0),
+        ))
+        val out = PhotoIngest.expandForKeepMode(listOf(1L, 2L, 3L), dup, DedupKeepMode.KEEP_PLAIN)
+        assertEquals(listOf(2L), out, "KEEP_PLAIN 应保留 _original（分数 1 < compressed 2），与列表顺序无关")
+    }
+
+    @Test
     fun `展开保持输入顺序且去重`() {
         val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
         val out = PhotoIngest.expandForKeepMode(listOf(2L, 3L, 1L), dup, DedupKeepMode.KEEP_WATERMARKED)
