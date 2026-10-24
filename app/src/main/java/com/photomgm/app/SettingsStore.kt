@@ -4,6 +4,7 @@
 package com.photomgm.app
 
 import algorithm.ClassifyResult
+import algorithm.DedupKeepMode
 import algorithm.Intervention
 import algorithm.Kind
 import algorithm.ParsedLog
@@ -34,6 +35,13 @@ class SettingsStore(context: Context) {
     var namingTemplate: Int
         get() = prefs.getInt(KEY_TEMPLATE, 1)
         set(v) = prefs.edit().putInt(KEY_TEMPLATE, v).apply()
+
+    /** ★ 2026-10-24 B1：重复照片保留策略（带水印 / 不带水印 / 都保留），默认仅保留带水印。 */
+    var dedupKeepMode: DedupKeepMode
+        get() = prefs.getString(KEY_DEDUP_MODE, null)?.let { raw ->
+            runCatching { DedupKeepMode.valueOf(raw) }.getOrNull()
+        } ?: DedupKeepMode.KEEP_WATERMARKED
+        set(v) = prefs.edit().putString(KEY_DEDUP_MODE, v.name).apply()
 
     var logsText: String
         get() = prefs.getString(KEY_LOGS, "") ?: ""
@@ -269,6 +277,7 @@ class SettingsStore(context: Context) {
         const val KEY_DIRS = "source_dirs"
         const val KEY_OUTPUT = "output_dir"
         const val KEY_TEMPLATE = "naming_template"
+        const val KEY_DEDUP_MODE = "dedup_keep_mode"
         const val KEY_LOGS = "logs_text"
         const val KEY_OVERRIDE = "photo_override"
         const val KEY_MARKED = "photo_marked"

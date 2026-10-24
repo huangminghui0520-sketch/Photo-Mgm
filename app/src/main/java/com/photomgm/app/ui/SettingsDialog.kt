@@ -4,6 +4,7 @@
 package com.photomgm.app.ui
 
 import android.net.Uri
+import algorithm.DedupKeepMode
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -230,7 +231,37 @@ internal fun SettingsDialog(
                         }
                     }
 
-                    // ④ 缓存管理（防线二：手动刷新照片缓存）
+                    // ④ 重复照片（★ 2026-10-24 B1：三态动态分类，默认仅保留带水印）
+                    SettingGroup(icon = Icons.Filled.FolderZip, title = "重复照片") {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            NamingOption(
+                                selected = state.dedupKeepMode == DedupKeepMode.KEEP_WATERMARKED,
+                                onClick = { vm.setDedupKeepMode(DedupKeepMode.KEEP_WATERMARKED) },
+                                title = "仅保留带水印（默认）",
+                                example = "水印相机双份合并，保留带水印取证版",
+                            )
+                            NamingOption(
+                                selected = state.dedupKeepMode == DedupKeepMode.KEEP_PLAIN,
+                                onClick = { vm.setDedupKeepMode(DedupKeepMode.KEEP_PLAIN) },
+                                title = "仅保留不带水印",
+                                example = "双份合并保留原始版（会丢弃带水印取证版）",
+                            )
+                            NamingOption(
+                                selected = state.dedupKeepMode == DedupKeepMode.KEEP_BOTH,
+                                onClick = { vm.setDedupKeepMode(DedupKeepMode.KEEP_BOTH) },
+                                title = "两者都保留",
+                                example = "不去重，全部照片保留",
+                            )
+                            Text(
+                                "单份照片（仅带水印或仅不带水印）不受影响、一律保留；" +
+                                        "未匹配照片不参与去重、全量保留。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+
+                    // ⑤ 缓存管理（防线二：手动刷新照片缓存）
                     SettingGroup(icon = Icons.Filled.Refresh, title = "缓存管理") {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(

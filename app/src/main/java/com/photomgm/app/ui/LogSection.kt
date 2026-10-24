@@ -132,7 +132,11 @@ fun LogSection(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            val effective = remember(classify, state.overrideMap) { vm.effectiveMap(classify) }
+            // ★ 2026-10-24 B1：预览用三态展开后的事件照片表（含人工移动），与导出一致；
+            //   remember key 含 dedupKeepMode —— 三态切换即时重建卡片照片数与缩略图
+            val effective = remember(classify, state.overrideMap, state.dedupKeepMode) {
+                vm.previewEventMap(classify)
+            }
             val effectiveUnmatched = remember(classify, state.overrideMap) { vm.effectiveUnmatched(classify) }
             val photosById = remember(state.photos) { state.photos.associateBy { it.id } }
             val pendingEvents = parsed.events.filter { it.id in classify.pendingEventIds }
