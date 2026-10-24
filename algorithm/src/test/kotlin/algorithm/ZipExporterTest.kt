@@ -287,6 +287,25 @@ class ZipExporterTest {
         assertTrue("01_桥下_施工_测试/a.jpg" in zipNames(zip))
     }
 
+    @Test fun `断点续传_路径含特殊字符仍正确跳过`() {
+        // 回归 P2-3：原手写正则 `"completed":\s*\[(.*?)\]` 在路径含 `]` 时提前截断、
+        // 含 `,` 时 split 拆碎 → completed 集合解析错误 → 断点续传误判"集合不等"而重新打包。
+        // 文件夹名（事件类型 sanitize 不替换 `]`/`,`）与文件名均构造特殊字符。
+        val (p1, _) = makePhoto(1, "a],c.jpg", "A")
+        val e = ev(1, at(8, 30), at(10, 0), type = "交安]设施,巡检")
+        val zip = File(tmp, "outSpecial.zip")
+        val state = File(tmp, "export_state_special.json")
+        // 首次导出（写 state）
+        val r1 = ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
+            { p1 }, 0, zip, state) { _, _ -> }
+        assertEquals(1, r1.copied)
+        // 同集合再次导出 → 必须整包跳过（旧解析在 `]` 处截断 → 误判集合不等 → 重新打包）
+        val r2 = ZipExporter().export(listOf(e), mapOf(1 to listOf(1L)), emptyList(),
+            { p1 }, 0, zip, state) { _, _ -> }
+        assertEquals(1, r2.skippedFromState, "路径含 ] / , 时断点续传仍应正确跳过")
+        assertEquals(0, r2.copied)
+    }
+
     @Test fun `文件夹按结束时间排序并带序号前缀`() {
         // 回归 P2-4：events 乱序传入 → ZIP 条目按结束时间升序、序号 01/02/03、未分类 99_ 固定最后
         val (p1, _) = makePhoto(1, "a.jpg", "A")
