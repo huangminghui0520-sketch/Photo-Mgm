@@ -101,22 +101,47 @@ internal fun haversineM(lat1: Double, lng1: Double, lat2: Double, lng2: Double):
     return R * 2 * atan2(sqrt(h), sqrt(1 - h))
 }
 
-/** 是否为派生文件（_original/_compressed 等），用于区分「带水印主图」与「无水印备份」。 */
-internal fun isDerivedName(name: String): Boolean {
-    val lower = name.lowercase()
-    return lower.contains("_original") || lower.contains("_compressed") || lower.contains("_edited") ||
-        lower.contains("_modified") || lower.contains("_optimized") || lower.contains("_resized") ||
-        lower.contains("_缩略") || lower.contains("_压缩") || lower.contains("_原图")
+/**
+ * 派生后缀统一清单（★ P3-5 单一事实来源）。
+ * PhotoSource.dedupDerived 的基名剥离、本文件的 isDerived/score 全部走这里，
+ * 消除"派生后缀名单三处各自维护、新增后缀易漏改"的漂移风险。
+ * 语义：带水印主图（无后缀）=0 < _original（无水印原图）=1 < _compressed（压缩副本）=2。
+ */
+internal object DerivedNames {
+    /** 派生后缀词（不含下划线前缀）；新增加工后缀只需改这里。 */
+    val suffixes: List<String> = listOf(
+        "original", "compressed", "edited", "modified", "optimized", "resized",
+        "缩略", "压缩", "原图",
+    )
+
+    /** 剥离派生后缀与扩展名的正则（_original_compressed 可叠加；紧跟扩展名之前）。 */
+    val stripRe: Regex =
+        Regex("""(_(?:${suffixes.joinToString("|")}))+(?=\.[^.]+$)""", RegexOption.IGNORE_CASE)
+
+    /** 是否为派生文件（_original/_compressed 等），用于区分「带水印主图」与「无水印备份」。 */
+    fun isDerived(name: String): Boolean {
+        val lower = name.lowercase()
+        return suffixes.any { lower.contains("_$it") }
+    }
+
+    /** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2。 */
+    fun score(name: String): Int {
+        val lower = name.lowercase()
+        var s = 0
+        if (lower.contains("_original")) s += 1
+        if (lower.contains("_compressed")) s += 2
+        return s
+    }
+
+    /** 是否为 _original（水印相机原图语义，独立照片候选）。 */
+    fun isOriginal(name: String): Boolean = name.lowercase().contains("_original")
 }
 
-/** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2（与 dedupDerived 保持一致）。 */
-internal fun derivedScore(name: String): Int {
-    val lower = name.lowercase()
-    var s = 0
-    if (lower.contains("_original")) s += 1
-    if (lower.contains("_compressed")) s += 2
-    return s
-}
+/** 是否为派生文件（_original/_compressed 等），统一走 [DerivedNames]。 */
+internal fun isDerivedName(name: String): Boolean = DerivedNames.isDerived(name)
+
+/** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2。 */
+internal fun derivedScore(name: String): Int = DerivedNames.score(name)
 
 /**
  * 内容判重分组（仅标记、不删除）：全量照片按「时间容差 + GPS 距离阈值」两两合并为重复组。
@@ -176,7 +201,11 @@ fun PhotoIngest.expandForKeepMode(
     for ((repId, dupList) in dupGroups) {
         val chosen = when (keepMode) {
             DedupKeepMode.KEEP_WATERMARKED -> repId
-            DedupKeepMode.KEEP_PLAIN -> dupList.firstOrNull { isDerivedName(it.displayName) }?.id ?: repId
+            // ★ P3-6：不带水印版 = 组内派生成员中分数最低者（_original=1 优先于 _compressed=2）；
+            //   原实现取"列表顺序第一个派生"存在顺序依赖（同组含 _original 与 _compressed 时可能选错）。
+            //   组内无派生（全部为主图）→ 回退代表（repId），与"仅保留不带水印"语义的保守兜底一致。
+            DedupKeepMode.KEEP_PLAIN -> dupList.filter { isDerivedName(it.displayName) }
+                .minByOrNull { derivedScore(it.displayName) }?.id ?: repId
             DedupKeepMode.KEEP_BOTH -> repId // 不可达（上方已返回）
         }
         preferred[repId] = chosen
