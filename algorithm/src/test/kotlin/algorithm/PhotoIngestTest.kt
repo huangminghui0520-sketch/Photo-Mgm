@@ -211,4 +211,99 @@ class PhotoIngestTest {
         assertEquals(2, out.size)
         assertEquals(1, merged)
     }
+
+    // ---- ★ 2026-10-24 方案B'：内容哈希双层判定（水印相机同序号 original 误杀修复） ----
+
+    /** 哈希表版 hashReader：ref -> SHA（缺项 = null，模拟读失败）。 */
+    private fun hashOf(vararg pairs: Pair<String, String?>): (String) -> String? {
+        val m = pairs.toMap()
+        return { ref -> m[ref] }
+    }
+
+    @Test fun `水印相机同序号original哈希不同保留为独立照片`() {
+        // 真机证据：IMG_20261024_101014661.jpg + IMG_20261024_101014661_original.jpg
+        // 同一次快门（EXIF 同刻同 GPS），内容 = 主图+水印合成 → 哈希不同 → original 必须保留
+        val candidates = listOf(
+            c(1, "a/IMG_20261024_101014661.jpg", "IMG_20261024_101014661.jpg"),
+            c(2, "a/IMG_20261024_101014661_original.jpg", "IMG_20261024_101014661_original.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("a/IMG_20261024_101014661.jpg" to "AA", "a/IMG_20261024_101014661_original.jpg" to "BB"),
+        )
+        assertEquals(2, out.size, "哈希不同 + _original → 独立照片保留（bug 修复）")
+        assertEquals(0, merged)
+        assertEquals("IMG_20261024_101014661_original.jpg", out[1].displayName)
+    }
+
+    @Test fun `同内容复制副本哈希一致仍合并`() {
+        // 未来某相机真输出"同内容 _original 副本" → 哈希一致 → 应合并（安全网，不重复）
+        val candidates = listOf(
+            c(1, "a/IMG_x.jpg", "IMG_x.jpg"),
+            c(2, "a/IMG_x_original.jpg", "IMG_x_original.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("a/IMG_x.jpg" to "SAME", "a/IMG_x_original.jpg" to "SAME"),
+        )
+        assertEquals(1, out.size)
+        assertEquals("IMG_x.jpg", out[0].displayName)
+        assertEquals(1, merged)
+    }
+
+    @Test fun `压缩副本哈希不同仍按加工副本合并`() {
+        // 9-25 场景：主图 + _compressed（压缩编码内容不同）→ 必须合并，避免压缩版落未分类
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(2, "a/IMG_20260925_080504148_compressed.jpeg", "IMG_20260925_080504148_compressed.jpeg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("a/IMG_20260925_080504148.jpg" to "A", "a/IMG_20260925_080504148_compressed.jpeg" to "B"),
+        )
+        assertEquals(1, out.size)
+        assertEquals("IMG_20260925_080504148.jpg", out[0].displayName)
+        assertEquals(1, merged)
+    }
+
+    @Test fun `original哈希读取失败保守保留`() {
+        // 哈希不可读（content:// URI / 文件被删）→ 保守保留 original（宁可多留，不丢独立照片）
+        val candidates = listOf(
+            c(1, "content://media/IMG_y.jpg", "IMG_y.jpg"),
+            c(2, "content://media/IMG_y_original.jpg", "IMG_y_original.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("content://media/IMG_y.jpg" to "A"),   // original 哈希缺项 → null
+        )
+        assertEquals(2, out.size)
+        assertEquals(0, merged)
+    }
+
+    @Test fun `主图哈希失败original哈希成功仍保留original`() {
+        val candidates = listOf(
+            c(1, "content://media/IMG_z.jpg", "IMG_z.jpg"),
+            c(2, "content://media/IMG_z_original.jpg", "IMG_z_original.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("content://media/IMG_z_original.jpg" to "B"),   // 主图哈希缺项 → 无法判定一致 → 保守保留
+        )
+        assertEquals(2, out.size)
+        assertEquals(0, merged)
+    }
+
+    @Test fun `无主图时哈希双层判定仍保留original合并compressed`() {
+        val candidates = listOf(
+            c(1, "a/IMG_w_compressed.jpeg", "IMG_w_compressed.jpeg"),
+            c(2, "a/IMG_w_original.jpg", "IMG_w_original.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(
+            candidates,
+            hashOf("a/IMG_w_compressed.jpeg" to "X", "a/IMG_w_original.jpg" to "Y"),
+        )
+        assertEquals(1, out.size)
+        assertEquals("IMG_w_original.jpg", out[0].displayName, "基准 = 分数最小（_original）")
+        assertEquals(1, merged, "压缩版为加工副本 → 合并")
+    }
 }

@@ -8,6 +8,7 @@ import algorithm.PhotoIngest
 import algorithm.model.Photo
 import android.content.Context
 import com.photomgm.data.ExifPhotoReader
+import com.photomgm.data.FileHasher
 import com.photomgm.data.MediaStorePhotoSourceProvider
 import com.photomgm.data.PhotoCache
 import java.time.LocalDate
@@ -17,6 +18,8 @@ class PhotoRepository(context: Context) {
     private val provider = MediaStorePhotoSourceProvider(appContext.contentResolver)
     private val exif: ExifPhotoReader = ExifPhotoReader()
     private val cache = PhotoCache()
+    /** 方案B'：派生去重内容哈希（区分"复制副本"与"水印相机独立 original"）。 */
+    private val hasher = FileHasher()
 
     /**
      * 多源目录候选合并 → 目录白名单 + 文件名日期粗筛 → 派生文件基名去重 → 按 sourceRef 去重。
@@ -29,7 +32,10 @@ class PhotoRepository(context: Context) {
         cache.get(key, System.currentTimeMillis())?.let { return it }
         val all = mutableListOf<CandidatePhoto>()
         for (dir in sourceDirs) all += provider.listCandidates(dir)   // 每源独立查询（§4.4）
-        val (deduped, merged) = PhotoIngest.dedupDerived(PhotoIngest.coarseFilter(all, sourceDirs, date..date))
+        val (deduped, merged) = PhotoIngest.dedupDerived(
+            PhotoIngest.coarseFilter(all, sourceDirs, date..date),
+            hasher::sha256,   // 方案B'：内容哈希双层判定，保留水印相机同序号 original
+        )
         val result = deduped
         cache.put(key, result, System.currentTimeMillis())
         return result
@@ -43,7 +49,10 @@ class PhotoRepository(context: Context) {
     fun coarseCandidatesFresh(date: LocalDate, sourceDirs: List<String>): List<CandidatePhoto> {
         val all = mutableListOf<CandidatePhoto>()
         for (dir in sourceDirs) all += provider.listCandidates(dir)
-        val (deduped, _) = PhotoIngest.dedupDerived(PhotoIngest.coarseFilter(all, sourceDirs, date..date))
+        val (deduped, _) = PhotoIngest.dedupDerived(
+            PhotoIngest.coarseFilter(all, sourceDirs, date..date),
+            hasher::sha256,   // 方案B'：内容哈希双层判定，保留水印相机同序号 original
+        )
         return deduped
     }
 

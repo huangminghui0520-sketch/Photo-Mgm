@@ -88,14 +88,30 @@ object PhotoIngest {
     }
 
     /**
-     * 派生文件去重（2026-10-01 新增）：同一照片存在主图 + 压缩版/原图备份等多份派生文件时，
-     * 按「基名（去掉派生后缀与扩展名）」分组，每组保留最高优先级版本。
-     * 优先级：主图（无派生后缀）> _original > _compressed > 其余派生后缀。
-     * 修复场景：9-25 实例 124 个文件 = 62 张主图 + 62 个 _compressed 派生文件，
-     * 派生文件无 EXIF 时间/GPS 全部进「未分类」，且与主图重复。
+     * 派生文件去重（2026-10-01 新增；2026-10-24 方案B' 双层判定）：
+     * 同一照片存在主图 + 压缩版/原图备份等多份派生文件时，按「基名（去掉派生后缀与扩展名）」分组，
+     * 每组保留最高优先级版本（主图（无派生后缀）> _original > _compressed > 其余派生后缀）。
+     *
+     * ★ 2026-10-24 方案B'（水印相机同序号 original 误杀修复）：
+     *   水印相机每按一次快门同时输出「主图 IMG_xxx.jpg + 原图 IMG_xxx_original.jpg」，
+     *   文件名序号可能相同（IMG_...661.jpg + IMG_...661_original.jpg）→ 去后缀基名完全相同，
+     *   旧逻辑把 original 当「同一照片的派生副本」剔除（真机 10:10/10:22/15:59 各丢 1 张无水印）。
+     *   同一次快门的 original 是独立照片（内容 = 主图 + 水印合成，EXIF 同刻同 GPS），
+     *   与「同一照片的派生副本」在元数据上不可区分（时间/GPS/像素全一致）→ 新增内容哈希双层判定：
+     *     - 同基名 + 内容哈希一致        → 确为同一照片的复制副本     → 合并（任何后缀）
+     *     - 同基名 + 哈希不同 + _original → 独立照片（水印相机原图）    → 保留
+     *     - 同基名 + 哈希不同 + 其他派生  → 加工副本（压缩/编辑）      → 合并（9-25 场景）
+     *     - _original 且哈希读取失败     → 保守保留（宁可多留，不丢独立照片）
+     *   修复场景：9-25 实例 124 个文件 = 62 张主图 + 62 个 _compressed 派生文件，
+     *   派生文件无 EXIF 时间/GPS 全部进「未分类」，且与主图重复。
+     *
+     * @param hashReader 文件内容哈希读取（Android 注入 FileHasher；null = 未注入，退化为旧行为「按基名+分数合并」）。
      * @return Pair(去重后候选, 合并组数)（合并组数供 UI 提示「已合并 N 组派生文件」）
      */
-    fun dedupDerived(candidates: List<CandidatePhoto>): Pair<List<CandidatePhoto>, Int> {
+    fun dedupDerived(
+        candidates: List<CandidatePhoto>,
+        hashReader: ((String) -> String?)? = null,
+    ): Pair<List<CandidatePhoto>, Int> {
         // 派生后缀：_compressed/_original/_edited/_modified 等（紧跟扩展名之前，可叠加如 _original_compressed）
         val derivedRe = Regex("""(_(?:compressed|original|edited|modified|optimized|resized|缩略|压缩|原图))+(?=\.[^.]+$)""", RegexOption.IGNORE_CASE)
 
@@ -106,29 +122,51 @@ object PhotoIngest {
             return if (dot >= 0) stem.substring(0, dot) else stem
         }
 
-        /** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2 < _original_compressed=3。 */
-        fun score(name: String): Int {
-            val lower = name.lowercase()
-            var s = 0
-            if (lower.contains("_original")) s += 1
-            if (lower.contains("_compressed")) s += 2
-            return s
-        }
+        /** 派生优先级分数：越小越优先（复用 Dedup.kt 统一实现：主图=0 < 仅_original=1 < 仅_compressed=2）。 */
+        fun score(name: String): Int = derivedScore(name)
 
-        val best = LinkedHashMap<String, CandidatePhoto>()
-        var merged = 0
+        /** 是否为 _original（水印相机原图语义，独立照片候选）。 */
+        fun isOriginal(name: String): Boolean = name.lowercase().contains("_original")
+
+        // 先按基名分组（保序），再逐组按方案B' 判定
+        val groups = LinkedHashMap<String, MutableList<CandidatePhoto>>()
         for (c in candidates) {
-            val key = baseName(c.displayName)
-            val prev = best[key]
-            if (prev == null) {
-                best[key] = c
-            } else if (score(c.displayName) < score(prev.displayName)) {
-                best[key] = c; merged++
-            } else {
-                merged++
+            groups.getOrPut(baseName(c.displayName)) { mutableListOf() }.add(c)
+        }
+        val out = mutableListOf<CandidatePhoto>()
+        var merged = 0
+        for ((_, g) in groups) {
+            if (g.size == 1) {
+                out.add(g[0])
+                continue
+            }
+            // 基准 = 组内分数最低者（主图优先）；其余文件逐一定夺保留/合并
+            val ordered = g.sortedBy { score(it.displayName) }
+            val base = ordered.first()
+            out.add(base)
+            val baseHash = if (hashReader != null) hashReader(base.sourceRef) else null
+            for (f in ordered.drop(1)) {
+                val keep = if (hashReader != null) {
+                    val fHash = hashReader(f.sourceRef)
+                    val sameContent = baseHash != null && fHash != null && baseHash == fHash
+                    when {
+                        // ① 内容一致 → 同一照片复制副本 → 合并
+                        sameContent -> false
+                        // ② _original 且哈希未知（任一方读失败）→ 保守保留
+                        isOriginal(f.displayName) && (fHash == null || baseHash == null) -> true
+                        // ③ _original 且哈希不同 → 独立照片（水印相机原图）→ 保留
+                        isOriginal(f.displayName) -> true
+                        // ④ 其他派生后缀 → 加工副本（压缩/编辑）→ 合并
+                        else -> false
+                    }
+                } else {
+                    // hashReader 未注入 → 旧行为：同基名派生文件一律合并
+                    false
+                }
+                if (keep) out.add(f) else merged++
             }
         }
-        return best.values.toList() to merged
+        return out to merged
     }
 
     /**
