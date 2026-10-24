@@ -5,7 +5,12 @@ package com.photomgm.app
 import algorithm.AlgorithmApi
 import algorithm.ClassifyResult
 import algorithm.CandidatePhoto
+import algorithm.DedupConfig
+import algorithm.DedupKeepMode
 import algorithm.ParsedLog
+import algorithm.PhotoIngest
+import algorithm.expandForKeepMode
+import algorithm.groupDupContent
 import algorithm.model.Photo
 import algorithm.model.LedgerRow
 import algorithm.model.LogEvent
@@ -27,6 +32,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -40,6 +46,8 @@ data class UiState(
     val sourceDirs: List<String> = emptyList(),
     val outputDir: String? = null,
     val namingTemplate: Int = 1,          // 0=事件类型，1=月日+巡查日志内容（默认1）
+    /** ★ 2026-10-24 B1：重复照片保留策略（带水印/不带水印/都保留），默认仅保留带水印。 */
+    val dedupKeepMode: DedupKeepMode = DedupKeepMode.KEEP_WATERMARKED,
     val coarseCount: Int? = null,          // 粗筛「已筛出 N 张」
     val logsText: String = "",
     val parsed: ParsedLog? = null,
@@ -107,6 +115,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** ★ 自动流水线任务句柄：日期/源目录变更后触发，新变更取消旧任务，避免并发扫描。 */
     private var pipelineJob: Job? = null
 
+    /** ★ P2-1：台账行重建任务句柄（parseLogs/runClassify 完成后触发）；避免并发重建晚到覆盖。 */
+    private var ledgerJob: Job? = null
+
+    /**
+     * ★ P2-2：dupGroupsOf 结果缓存——照片 List 引用未变（集合未变）则复用，
+     * 避免三态切换/预览/导出每次全量 O(n²) 重算。groupDupContent 为纯函数（幂等），
+     * 跨线程引用赋值原子；@Volatile 保证可见性，最坏情况是重复计算一次、结果一致。
+     */
+    @Volatile private var dupGroupsCacheRef: List<Photo>? = null
+    @Volatile private var dupGroupsCacheResult: Map<Long, List<Photo>> = emptyMap()
+
     /** ★ 单日照片缓存（进程内）：只保留**当前巡查日期**一份，换日期即覆盖（2026-10-07 采纳建议）。
      *   跨进程重启由 SettingsStore 状态缓存兜底。 */
     private data class DatePhotoCache(val date: LocalDate, val photos: List<Photo>, val coarseCount: Int)
@@ -117,6 +136,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 date = store.date, sourceDirs = store.sourceDirs,
                 outputDir = store.outputDir, namingTemplate = store.namingTemplate,
+                dedupKeepMode = store.dedupKeepMode,
                 logsText = store.logsText, overrideMap = store.overrideMap,
                 marked = store.markedMap,
                 // ★ 2026-10-07 需求：打开 App 从缓存恢复关闭前的事件列表 + 分类 + 照片，
@@ -133,7 +153,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             val s0 = state.value
             if (s0.sourceDirs.isEmpty() || s0.photos.isEmpty()) return@launch
-            val latest = repo.coarseCandidatesFresh(s0.date, s0.sourceDirs)
+            val latest = repo.coarseCandidates(s0.date, s0.sourceDirs)
             if (latest.map { it.id }.toSet() != s0.photos.map { it.id }.toSet()) {
                 store.clearStateCache()
                 _state.update {
@@ -161,7 +181,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // ★ 日期没变就不重跑：避免重复选同一天时清掉刚缓存的缩略图、导致界面闪一下重新解码
         if (d == store.date) return
         store.date = d
-        repo.clearCache()
         clearThumbnailCache()
         store.clearStateCache()
         _state.update {
@@ -176,7 +195,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun addSourceDir(dir: String) {
         val dirs = (state.value.sourceDirs + dir).distinct()
         store.sourceDirs = dirs
-        repo.clearCache()
         clearThumbnailCache()
         store.clearStateCache()
         photoCache = null
@@ -187,7 +205,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun removeSourceDir(dir: String) {
         val dirs = state.value.sourceDirs - dir
         store.sourceDirs = dirs
-        repo.clearCache()
         clearThumbnailCache()
         store.clearStateCache()
         photoCache = null
@@ -215,8 +232,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             // ★ 2026-10-07 与 parseLogs 同构：日期/源目录变化 = 全新一批照片与事件，上一批人工移动作废
             store.overrideMap = emptyMap()
-            // ★ 防线一：强制实时粗筛（绕过 30 分钟 TTL）——拿最新 ID 集合，删除/新增照片立即感知
-            val cands = repo.coarseCandidatesFresh(s.date, s.sourceDirs)
+            // ★ 防线一：强制实时粗筛（P3-4：粗筛已无 TTL 缓存，每次直接查 MediaStore）——拿最新 ID 集合，删除/新增照片立即感知
+            val cands = repo.coarseCandidates(s.date, s.sourceDirs)
             if (cands.isEmpty()) {
                 photoCache = null
                 _state.update {
@@ -286,6 +303,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setNamingTemplate(t: Int) { store.namingTemplate = t; _state.update { it.copy(namingTemplate = t) } }
 
+    /**
+     * ★ 2026-10-24 B1：重复照片保留策略切换（带水印 / 不带水印 / 都保留）。
+     * 仅作用于输出层（台账/ZIP）：不重跑粗筛/EXIF/分组/分类；已分类事件照片按三态展开，
+     * 人工标记（marked）优先保留；未匹配照片不参与、全量保留。
+     */
+    fun setDedupKeepMode(mode: DedupKeepMode) {
+        if (mode == state.value.dedupKeepMode) return
+        store.dedupKeepMode = mode
+        // ★ P2-1：台账与模式在同一事务内同步重算（当前规模毫秒级），替代原异步 launch——
+        //   原实现每次切换异步重建台账，快速连切（A→B→A）时旧协程晚到覆盖新协程，
+        //   导致底栏台账行与当前模式错配。同步计算天然无竞态。
+        _state.update { cur ->
+            val next = cur.copy(dedupKeepMode = mode)
+            if (next.classify != null) next.copy(ledger = computeLedger(next)) else next
+        }
+        // 口径提示：合并 N 组 / 单份 M 张不受影响
+        val s = state.value
+        val dup = dupGroupsOf(s)
+        val inGroups = dup.values.sumOf { it.size + 1 }
+        val single = s.photos.size - inGroups
+        // ★ P3-7：KEEP_BOTH 实际"全部保留、不合并"，文案不得再说"已合并"（避免误导）
+        val msg = when (mode) {
+            DedupKeepMode.KEEP_WATERMARKED ->
+                "已合并 ${dup.size} 组重复照片（保留带水印版）；单份照片 $single 张不受影响"
+            DedupKeepMode.KEEP_PLAIN ->
+                "已合并 ${dup.size} 组重复照片（保留不带水印版）；单份照片 $single 张不受影响"
+            DedupKeepMode.KEEP_BOTH ->
+                "重复照片全部保留（共 ${dup.size} 组，每组带水印/不带水印双份）；单份照片 $single 张不受影响"
+        }
+        _state.update { it.copy(message = msg) }
+    }
+
     // ---------- SAF 目录选择（§8.2 系统选择器选取，不再手打路径） ----------
 
     /**
@@ -325,10 +374,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- 日志（§3：粘贴 → 解析，如实显示不脱敏） ----------
     fun setLogsText(text: String) { store.logsText = text; _state.update { it.copy(logsText = text) } }
 
-    /** ★ 删除日志：清文本 + 清解析/匹配结果 + 清粗筛缓存（§4.4），避免旧匹配残留。 */
+    /** ★ 删除日志：清文本 + 清解析/匹配结果（P3-4：粗筛已无 TTL 缓存，无需再清），避免旧匹配残留。 */
     fun clearLogs() {
         store.logsText = ""
-        repo.clearCache()
         store.clearStateCache()
         _state.update { it.copy(logsText = "", parsed = null, classify = null, ledger = null, exportMessage = null) }
     }
@@ -353,7 +401,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // ★ 防线一：照片校验——删除/新增照片后即使文本未改也要重扫重分类，
                 //   避免旧 classify 引用失效 URI（灰块）。
                 val photosUnchanged = s.sourceDirs.isEmpty() || s.photos.isEmpty() ||
-                    repo.coarseCandidatesFresh(s.date, s.sourceDirs)
+                    repo.coarseCandidates(s.date, s.sourceDirs)
                         .map { it.id }.toSet() == s.photos.map { it.id }.toSet()
                 if (photosUnchanged) {
                     val n = s.overrideMap.size
@@ -364,6 +412,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             message = if (n > 0) "已恢复最初分类（清除 $n 条人工移动）" else "已是最初分类状态",
                         )
                     }
+                    // ★ P3-8：人工移动被清空 → 分类恢复最初状态，同步刷新台账行（底栏计数随最新分类）
+                    buildLedger()
                     return@launch
                 }
                 // 照片已增删 → 落入下方完整流水线（清缓存重扫 + 重新解析分类）
@@ -382,7 +432,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 saveStateCache(p, null, emptyList(), 0)
                 return@launch
             }
-            val latestCands = repo.coarseCandidatesFresh(s.date, s.sourceDirs)
+            val latestCands = repo.coarseCandidates(s.date, s.sourceDirs)
             if (latestCands.isEmpty()) {
                 photoCache = null
                 _state.update {
@@ -402,7 +452,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 coarse = s.coarseCount ?: s.photos.size
             } else {
                 // 照片未就绪或已增删 → 完整精读（粗筛已实时跑过）
-                repo.clearCache()
                 clearThumbnailCache()
                 _state.update { it.copy(parsed = p, progressStage = "读取照片信息中…") }
                 photos = repo.readExif(latestCands)
@@ -421,17 +470,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             // ★ 流水线完成 → 写状态缓存（打开 App 恢复用）
             saveStateCache(p, c, photos, coarse)
+            // ★ P3-8：解析日志自动分类完成 → 同步生成台账行（底栏「台账 N 行」不再等导出才回填）
+            buildLedger()
         }
     }
 
     /**
      * ★ 2026-10-07 防线二：手动刷新照片缓存（设置页入口）。
-     * 清进程内单日缓存 + 粗筛缓存 + 缩略图缓存 + 持久化状态缓存，强制完整重扫。
+     * 清进程内单日缓存 + 缩略图缓存 + 持久化状态缓存，强制完整重扫（P3-4：粗筛已无 TTL 缓存）。
      * 事件列表（parsed）保留——照片变化不影响日志事件；重新解析即自动重新分类。
      */
     fun refreshPhotoCache() {
         photoCache = null
-        repo.clearCache()
         clearThumbnailCache()
         store.clearStateCache()
         _state.update {
@@ -455,6 +505,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(classify = c, busy = false, progressStage = null) }
         // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
         saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
+        // ★ P3-8：手动分类完成 → 同步刷新台账行
+        buildLedger()
     }
 
     /**
@@ -470,17 +522,65 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked, s.namingTemplate)
     }
 
+    // ---------- ★ 2026-10-24 B1：输出层三态展开（分类不变，仅台账/ZIP 生效） ----------
+
+    /** 判重配置：时间容差 1s + GPS 距离 10m（Dedup.kt 默认值）。 */
+    private fun dedupConfig(): DedupConfig = DedupConfig()
+
     /**
-     * 单独生成台账行并存入 state（**当前无 UI 入口**，保留供将来做台账预览页）。
-     *
-     * 注意：ZIP 导出路径走 [prepareLedger]，不经过本方法——本方法是独立入口，
-     * 若将来删除"台账预览"计划，应连同 [UiState.ledger] 的语义一并清理。
+     * 内容判重分组（全量照片）。
+     * ★ P2-2：结果按照片 List 引用缓存——照片集合未变（同引用）直接复用，
+     *   三态切换/预览/导出多次调用不再每次 O(n²) 重算；集合变化（新 List）自动失效重算。
      */
-    fun buildLedger() = viewModelScope.launch(Dispatchers.Default) {
-        val s = state.value
-        val c = s.classify ?: return@launch
-        val rows = buildRows(s, effectiveMap(c)) ?: return@launch
-        _state.update { it.copy(ledger = rows) }
+    private fun dupGroupsOf(s: UiState): Map<Long, List<Photo>> {
+        val photos = s.photos
+        if (dupGroupsCacheRef === photos) return dupGroupsCacheResult
+        val g = PhotoIngest.groupDupContent(photos, dedupConfig())
+        dupGroupsCacheRef = photos
+        dupGroupsCacheResult = g
+        return g
+    }
+
+    /**
+     * 已分类事件照片按三态展开（人工标记优先；未匹配不参与）。
+     * @param c 分类结果（含人工移动后的 effectiveMap 作为基准）
+     */
+    private fun expandedEventMap(s: UiState, c: ClassifyResult, mode: DedupKeepMode): Map<Int, List<Long>> {
+        val effective = effectiveMap(c)
+        if (mode == DedupKeepMode.KEEP_BOTH) return effective   // 都保留 = 不去重
+        val dup = dupGroupsOf(s)
+        val keepAlways = s.marked.values.flatMap { listOfNotNull(it.first, it.second) }.toSet()
+        return effective.mapValues { (_, ids) -> PhotoIngest.expandForKeepMode(ids, dup, mode, keepAlways) }
+    }
+
+    /**
+     * ★ 2026-10-24 B1：预览数据源（事件卡片 + 事件照片弹窗）。
+     * 与导出完全一致：人工移动 + 三态展开（已分类事件照片），未匹配不参与。
+     * UI 读本函数而非 effectiveMap，三态切换即时反映到预览。
+     */
+    fun previewEventMap(c: ClassifyResult): Map<Int, List<Long>> =
+        expandedEventMap(state.value, c, state.value.dedupKeepMode)
+
+    /**
+     * ★ P2-1：台账行计算（纯函数，供 setDedupKeepMode 同步调用与 buildLedger 异步调用共用，
+     *   避免两处生成逻辑分叉；以传入快照为准，保证 ledger 与调用时刻的 mode 一致）。
+     */
+    private fun computeLedger(s: UiState): List<LedgerRow>? {
+        val c = s.classify ?: return null
+        return buildRows(s, expandedEventMap(s, c, s.dedupKeepMode))
+    }
+
+    /**
+     * 台账行异步重建（parseLogs/runClassify 完成后调用）。
+     * ★ P2-1：先取消旧任务 + update 前 isActive 检查，防止并发重建晚到覆盖。
+     * 注意：三态切换不走本函数（setDedupKeepMode 同步计算），避免快速连切竞态。
+     */
+    fun buildLedger() {
+        ledgerJob?.cancel()
+        ledgerJob = viewModelScope.launch(Dispatchers.Default) {
+            val rows = computeLedger(state.value) ?: return@launch
+            if (isActive) _state.update { it.copy(ledger = rows) }
+        }
     }
 
     // ---------- 人工调整（§8.3） ----------
@@ -593,6 +693,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (failures.isNotEmpty()) " 失败[${failures.joinToString(",")}]" else ""
             Triple(rows, bytesCache, imgDebug)
         } catch (e: Exception) {
+            // ★ P3-9：记录异常（此前静默吞错，真机"台账未生成"无日志可查）
+            android.util.Log.w("Photo-Mgm", "prepareLedger 失败（台账未生成）", e)
             null
         }
     }
@@ -653,8 +755,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // ★ 2026-10-08 P0-2：photoById 建表 O(1)（替代线性 find，与 photoByRef 对齐）
             val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
             // ★ 打包前一刻计算最终分类快照（合并人工移动/移除），台账与打包共用同一份，保证照片一致
-            val finalMap = effectiveMap(c)
+            // ★ 2026-10-24 B1：已分类事件照片按三态展开（带水印/不带水印/都保留）；
+            //   未匹配照片不参与三态、全量保留（effectiveUnmatched 原样）
+            val finalMap = expandedEventMap(s, c, s.dedupKeepMode)
             val finalUnmatched = effectiveUnmatched(c)
+            val expandedTotal = finalMap.values.flatten().size + finalUnmatched.size   // 去重后张数
 
             // ★ 台账 Excel 准备（用同一个 finalMap，保证台账照片 = 实际打包的照片）
             val prep = prepareLedger(s, finalMap) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
@@ -705,7 +810,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             _state.update {
                 it.copy(
-                    exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}$failNote$skipNote$xlsxNote$writeNote",
+                    // ★ 2026-10-24 B1：导出消息附去重后张数（三态展开后的实际打包数）
+                    exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}（去重后共 $expandedTotal 张）$failNote$skipNote$xlsxNote$writeNote",
                     exportProgress = null,
                     // ★ 回填台账行：底部操作条要显示「台账 N 行」，也需要它判断导出完成。
                     //   以前此处不回填，导致 state.ledger 永远为 null、底栏永远显示"台账待生成"。
