@@ -112,21 +112,21 @@ object PhotoIngest {
         candidates: List<CandidatePhoto>,
         hashReader: ((String) -> String?)? = null,
     ): Pair<List<CandidatePhoto>, Int> {
-        // 派生后缀：_compressed/_original/_edited/_modified 等（紧跟扩展名之前，可叠加如 _original_compressed）
-        val derivedRe = Regex("""(_(?:compressed|original|edited|modified|optimized|resized|缩略|压缩|原图))+(?=\.[^.]+$)""", RegexOption.IGNORE_CASE)
+        // ★ P3-5：派生后缀清单统一走 Dedup.kt DerivedNames（单一事实来源），
+        //   基名剥离 / 打分 / _original 判定不再各自维护正则，新增后缀只改 DerivedNames.suffixes。
 
         /** 基名 = 文件名去掉全部派生后缀与扩展名（_original_compressed 与主图归同一基名）。 */
         fun baseName(name: String): String {
-            val stem = derivedRe.replace(name, "")
+            val stem = DerivedNames.stripRe.replace(name, "")
             val dot = stem.lastIndexOf('.')
             return if (dot >= 0) stem.substring(0, dot) else stem
         }
 
-        /** 派生优先级分数：越小越优先（复用 Dedup.kt 统一实现：主图=0 < 仅_original=1 < 仅_compressed=2）。 */
-        fun score(name: String): Int = derivedScore(name)
+        /** 派生优先级分数：越小越优先（Dedup.kt 统一实现：主图=0 < 仅_original=1 < 仅_compressed=2）。 */
+        fun score(name: String): Int = DerivedNames.score(name)
 
         /** 是否为 _original（水印相机原图语义，独立照片候选）。 */
-        fun isOriginal(name: String): Boolean = name.lowercase().contains("_original")
+        fun isOriginal(name: String): Boolean = DerivedNames.isOriginal(name)
 
         // 先按基名分组（保序），再逐组按方案B' 判定
         val groups = LinkedHashMap<String, MutableList<CandidatePhoto>>()
