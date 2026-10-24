@@ -216,7 +216,8 @@ fun UnifiedScreen(vm: AppViewModel) {
         val classify = state.classify
         if (parsed != null && classify != null) {
             val event = parsed.events.find { it.id == eventId }
-            val effective = vm.effectiveMap(classify)
+            // ★ 2026-10-24 B1：事件照片弹窗用三态展开后的列表（与导出一致），切换三态即时生效
+            val effective = vm.previewEventMap(classify)
             val photoIds = effective[eventId] ?: emptyList()
             val photos = photoIds.mapNotNull { pid -> state.photos.find { it.id == pid } }
             if (event != null) {
