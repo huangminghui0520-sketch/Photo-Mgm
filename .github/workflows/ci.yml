@@ -47,6 +47,15 @@ jobs:
   unit-test:
     name: Unit tests
     runs-on: ubuntu-24.04
+    # ★ TZ 必须固定（2026-10-31 首次跑测试时暴露）：
+    #   runner 默认 UTC，而生产代码在 7 处用 ZoneId.systemDefault() 把 epoch 毫秒解释成
+    #   本地时间（AlgorithmApi.parseLog / EventClassifyEngine×2 / LedgerEngine×2 /
+    #   LogParserEngine / ZipExporter，加上 app 侧 UI）。UTC 下台账日期列整体偏移 8 小时、
+    #   "当日零点"边界错位 → 5 条用例在本地(+08:00)绿、在 CI(UTC)红（已本地复现）。
+    #   固定 Asia/Shanghai 让 CI 与国内真机一致；"要不要把时区改成显式注入"是**产品级**
+    #   决策（牵动全链路语义），已单独立项待确认，不在本轮改动。
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout
         uses: actions/checkout@v5
