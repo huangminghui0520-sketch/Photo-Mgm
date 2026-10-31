@@ -155,6 +155,89 @@ class DedupKeepModeTest {
         assertEquals(listOf(1L, 3L), out)   // 2→1，顺序按输入
     }
 
+    // ── ★ 2026-10-31 B：人工移动照片直通三态（P1 目标事件显示错 + P2 源事件幽灵照片）──
+    @Test
+    fun `人工移动的照片直通 不被三态改写`() {
+        // P1 回归：用户把不带水印 2 号移动到目标事件；KEEP_WATERMARKED 下也必须原样保留 2，
+        // 不得被 preferred 改写为带水印 1 号（否则"移动的照片消失/显示成另一张"）。
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        val out = PhotoIngest.expandForKeepMode(listOf(2L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(2L))
+        assertEquals(listOf(2L), out)
+    }
+
+    @Test
+    fun `保留侧代表被移走 残留成员不再映射回代表 无幽灵照片`() {
+        // P2 回归：用户把带水印 1 号从事件移走；KEEP_WATERMARKED 下事件内残留的 2 号
+        // 不得再映射回 1 号（否则同一张 1 号同时出现在源事件与目标事件，看起来"没移走"）。
+        // ★ 2026-10-31 C 语义升级：不止"不映射回代表"，残留的 2 号本身也不得展示——
+        //   代表被移走 = 本瞬间的照片内容已离开源事件；2 号是无水印备份，在"仅保留带水印"下不该出现。
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        val out = PhotoIngest.expandForKeepMode(listOf(2L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(1L))
+        assertEquals(emptyList<Long>(), out, "代表被移走后，残留的无水印备份不得顶替展示")
+    }
+
+    @Test
+    fun `KEEP_PLAIN 人工移动直通与组失效对称`() {
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        // 用户把带水印 1 号移动到目标事件：1 直通原样
+        assertEquals(listOf(1L), PhotoIngest.expandForKeepMode(listOf(1L), dup, DedupKeepMode.KEEP_PLAIN, passthrough = setOf(1L)))
+        // 用户把不带水印 2 号移走：chosen=2 已被移走 → 组映射失效 → 残留 1 号（带水印）同样不展示
+        assertEquals(emptyList<Long>(), PhotoIngest.expandForKeepMode(listOf(1L), dup, DedupKeepMode.KEEP_PLAIN, passthrough = setOf(2L)),
+            "KEEP_PLAIN 下代表（_original）被移走，残留的带水印主图同样不得展示")
+    }
+
+    // ── ★ 2026-10-31 C：应保留版本被移走 → 整组不展示（新增边界）──
+    @Test
+    fun `应保留版本被移走 三成员组残留全部不展示`() {
+        // 组：1=主图（带水印）+ 2=_original + 3=_compressed；KEEP_WATERMARKED 下 chosen=1 被移走
+        // → 残留 2/3 均不得顶替展示（否则"仅保留带水印"会冒出无水印原图或压缩副本）。
+        // 用例价值：验证抑制覆盖**整组所有成员**，而非仅第一个成员。
+        val dup = mapOf(1L to listOf(
+            photo(2, "IMG_20261024_084736479_original.jpg", t0),
+            photo(3, "IMG_20261024_084736480_compressed.jpg", t0),
+        ))
+        val out = PhotoIngest.expandForKeepMode(listOf(2L, 3L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(1L))
+        assertEquals(emptyList<Long>(), out)
+    }
+
+    @Test
+    fun `仅移走残成员 不应抑制整组`() {
+        // ★ 反向保护：chosen(1) 未动、只把残成员 2 移走 → 组映射照常，源事件仍展示 1。
+        //   防止抑制条件被误写成「组内任一成员 ∈ passthrough」→ 过度丢弃、丢真实照片。
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        val out = PhotoIngest.expandForKeepMode(listOf(1L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(2L))
+        assertEquals(listOf(1L), out)
+    }
+
+    @Test
+    fun `人工台账标记压过整组抑制`() {
+        // ★ 优先级固定：keepAlways > passthrough > dropped > preferred（判断顺序不可调换）。
+        //   代表 1 被移走、残成员 2 被人工设为台账照片 → 2 必须保留。
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        val out = PhotoIngest.expandForKeepMode(listOf(2L), dup, DedupKeepMode.KEEP_WATERMARKED,
+            keepAlways = setOf(2L), passthrough = setOf(1L))
+        assertEquals(listOf(2L), out)
+    }
+
+    @Test
+    fun `抑制只作用于代表被移走的组 其他组不受影响`() {
+        // ★ 组隔离：两组并存，仅第一组的代表被移走；第二组必须照常折叠（2→1 的抑制不得外溢）。
+        val dup = mapOf(
+            1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)),
+            3L to listOf(photo(4, "IMG_20261024_084736481_original.jpg", t0 + 10_000)),
+        )
+        val out = PhotoIngest.expandForKeepMode(listOf(1L, 2L, 3L, 4L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(1L))
+        assertEquals(listOf(1L, 3L), out, "1 直通保留；2 被抑制；3/4 组照常折叠为 3")
+    }
+
+    @Test
+    fun `代表与残成员都被移走 两张都按人工意图展示`() {
+        // 双移：两张都进入 passthrough（人工显式移动）→ 人工意图压过三态，两张都在目标事件展示。
+        val dup = mapOf(1L to listOf(photo(2, "IMG_20261024_084736479_original.jpg", t0)))
+        val out = PhotoIngest.expandForKeepMode(listOf(1L, 2L), dup, DedupKeepMode.KEEP_WATERMARKED, passthrough = setOf(1L, 2L))
+        assertEquals(listOf(1L, 2L), out)
+    }
+
     // ── 派生判定 ──
     @Test
     fun `派生判定正确`() {

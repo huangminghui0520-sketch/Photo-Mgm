@@ -205,6 +205,38 @@ class RealDataE2ETest {
             zf.delete()   // 验证后清理（110张原图体积大，不留副本）
         }
 
+        // ── 12. ★ 2026-10-31 C：人工移动 + 三态展开闭环（本 bug 的真实危害复现）──
+        //      复现：把某组的「带水印代表」移出源事件、放进另一事件；展开后源事件不得再冒出
+        //      同组的 _original，ZIP 里也不得出现它（修复前它会落进源事件文件夹）。
+        val (movedRepId, movedMates) = dup2.entries.first { it.value.isNotEmpty() }
+        val srcEventId = cls.eventPhotoMap.entries.first { (_, ids) -> movedRepId in ids }.key
+        val dstEventId = cls.eventPhotoMap.keys.first { it != srcEventId }
+        val movedMap = cls.eventPhotoMap.mapValues { (_, ids) -> ids.toMutableList() }.toMutableMap()
+        movedMap[srcEventId] = movedMap[srcEventId]!!.filter { it != movedRepId }.toMutableList()
+        movedMap.getOrPut(dstEventId) { mutableListOf() }.add(movedRepId)
+        val movedPassthrough = setOf(movedRepId)
+        val movedExpanded = movedMap.mapValues { (_, ids) ->
+            PhotoIngest.expandForKeepMode(ids, dup2, DedupKeepMode.KEEP_WATERMARKED, emptySet(), movedPassthrough)
+        }
+        val mateIds = movedMates.map { it.id }
+        println("== 人工移动闭环: 代表#$movedRepId 事件#$srcEventId → 事件#$dstEventId（同组残片 $mateIds）")
+        assertTrue(movedRepId in movedExpanded[dstEventId].orEmpty(), "目标事件必须显示被移动的代表（人工意图直通）")
+        assertTrue(movedExpanded[srcEventId].orEmpty().none { it in mateIds },
+            "源事件不得再显示同组残留的 _original（本 bug 修复点）")
+        // ZIP 实证：导出物里不得因「代表被移走」而漏出无水印原图
+        val movedZip = File("D:/Photo-Mgm/Photo-Mgm/shots/real_e2e_moved_wm.zip")
+        if (movedZip.exists()) movedZip.delete()
+        val movedR = AlgorithmApi.exportZip(parsed.events, movedExpanded, cls.unmatched, photoById,
+            namingTemplate = 1, outFile = movedZip, stateFile = null, onProgress = { _, _ -> })
+        val movedJpg = countJpgEntries(movedZip)
+        val movedOrig = countOriginalEntries(movedZip)
+        // 未匹配池不过三态（既有约定），基线 = 未匹配里的 _original 数（本数据集未匹配 0 张）
+        val unmatchedOriginal = cls.unmatched.count { photoById(it)?.displayName.orEmpty().contains("_original", true) }
+        println("== 人工移动导出[仅带水印]: ${movedZip.name} ${movedZip.length()} 字节, jpg=$movedJpg, _original=$movedOrig, copied=${movedR.copied}, failed=${movedR.failed}")
+        movedZip.delete()   // 验证后清理
+        assertEquals(unmatchedOriginal, movedOrig, "代表被移走后，_original 不得因组映射失效漏进 ZIP")
+        assertEquals(54, movedJpg, "移动只改变归属、不改变总数：仍 54 张（无幽灵重复、无丢失）")
+
         // ── 断言 ──
         assertTrue(parsed.events.isNotEmpty(), "日志应解析出事件")
         assertTrue(uniq.isNotEmpty(), "照片应非空")

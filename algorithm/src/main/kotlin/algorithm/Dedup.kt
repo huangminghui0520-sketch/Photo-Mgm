@@ -186,7 +186,20 @@ fun PhotoIngest.groupDupContent(
 
 /**
  * 事件照片三态展开（仅作用于已分类事件照片；未匹配照片不调用本函数、全量保留）。
+ *
+ * ★ 2026-10-31 C：返回值是入参 photoIds 的**子集**——除三态折叠（组内成员改写为应保留版本）
+ *   外，还会"整组不展示"：组内"应保留版本"已被人工移走时，该组所有成员都不输出（见 [dropped]）。
+ *   调用方（预览 / 台账 / ZIP 导出）据此得到最终照片列表，故事件可能因此变为 0 张。
+ *
+ * 判定优先级（自上而下，顺序不可调换）：
+ *   1. keepAlways（人工台账标记）—— 最高，压过一切过滤；
+ *   2. passthrough（人工移动/移除过的照片）—— 用户显式意图，原样展示、不被三态改写；
+ *   3. dropped（应保留版本已被移走的重复组）—— 整组不展示；
+ *   4. preferred（三态折叠）—— 组内成员改写为应保留版本。
+ *
  * @param keepAlways 强制保留的 id（人工标记优先，跳过三态过滤）。
+ * @param passthrough 人工移动过的照片 id（用户显式意图，原样保留、不参与三态改写；
+ *   ★ 2026-10-31 B：同时用于"保留侧代表被移走 → 本组映射失效"，杜绝幽灵照片）。
  * @return 展开后的照片 id 列表（保序、去重）。
  */
 fun PhotoIngest.expandForKeepMode(
@@ -194,10 +207,13 @@ fun PhotoIngest.expandForKeepMode(
     dupGroups: Map<Long, List<Photo>>,
     keepMode: DedupKeepMode,
     keepAlways: Set<Long> = emptySet(),
+    passthrough: Set<Long> = emptySet(),
 ): List<Long> {
     if (keepMode == DedupKeepMode.KEEP_BOTH) return photoIds
     // 组内每个成员 id -> 应保留的版本 id
     val preferred = HashMap<Long, Long>()
+    // ★ 2026-10-31 C：应保留版本已被人工移走的重复组 → 整组不展示（成员 id 集合）。
+    val dropped = HashSet<Long>()
     for ((repId, dupList) in dupGroups) {
         val chosen = when (keepMode) {
             DedupKeepMode.KEEP_WATERMARKED -> repId
@@ -208,12 +224,31 @@ fun PhotoIngest.expandForKeepMode(
                 .minByOrNull { derivedScore(it.displayName) }?.id ?: repId
             DedupKeepMode.KEEP_BOTH -> repId // 不可达（上方已返回）
         }
+        // ★ 2026-10-31 B：保留侧代表已被人工移动（∈ passthrough）→ 本组不建立映射，
+        //   避免事件内残留成员映射回"已移走的代表"，否则同一张照片同时出现在源/目标事件（P2 幽灵）。
+        // ★ 2026-10-31 C：仅"不建立映射"还不够——残成员会走到 `preferred[id] ?: id` 原样展示，
+        //   于是"仅保留带水印"的源事件里冒出无水印备份（本 bug）。
+        //   语义：代表（应保留版本）被移走 = 该瞬间的照片内容已整体离开源事件 → 整组标记丢弃，
+        //   残留备份跟随三态过滤，不顶替展示。抑制仅限本组，其他组照常折叠。
+        if (chosen in passthrough) {
+            dropped.add(repId)
+            for (d in dupList) dropped.add(d.id)
+            continue
+        }
         preferred[repId] = chosen
         for (d in dupList) preferred[d.id] = chosen
     }
     val out = LinkedHashSet<Long>()
     for (id in photoIds) {
-        out.add(if (id in keepAlways) id else preferred[id] ?: id)
+        // 优先级 1/2：人工意图优先（★ 必须早于 dropped 判断，keepAlways 压过整组抑制）
+        if (id in keepAlways || id in passthrough) {
+            out.add(id)
+            continue
+        }
+        // 优先级 3：本组应保留版本已被移走 → 整组不展示
+        if (id in dropped) continue
+        // 优先级 4：三态折叠（无映射则原样保留，如单份照片）
+        out.add(preferred[id] ?: id)
     }
     return out.toList()
 }

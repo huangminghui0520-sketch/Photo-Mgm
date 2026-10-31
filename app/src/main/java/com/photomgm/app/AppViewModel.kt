@@ -21,9 +21,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -220,6 +222,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun autoPipeline() {
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
             val s = state.value
             if (s.sourceDirs.isEmpty()) {
                 _state.update { it.copy(coarseCount = null, photos = emptyList(), busy = false, progressStage = null) }
@@ -271,6 +274,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     else null)
             }
             saveStateCache(parsed, null, photos, cands.size)
+            } catch (e: CancellationException) {
+                throw e   // ★ 协程取消必须重抛（结构化并发），不吞
+            } catch (e: Exception) {
+                // ★ 2026-10-31 崩溃防御：照片扫描流水线任何未预期异常不得杀死应用
+                android.util.Log.w("Photo-Mgm", "扫描照片失败", e)
+                _state.update {
+                    it.copy(busy = false, progressStage = null,
+                        message = "扫描照片失败：${e.message ?: e.javaClass.simpleName}")
+                }
+            }
         }
     }
 
@@ -396,6 +409,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val s = state.value
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
             // ── 快路径：已解析 + 已分类 + 文本未变 + 照片未增删 → 只清人工移动表 ──
             if (s.parsed != null && s.classify != null && s.logsText == store.parsedLogsText) {
                 // ★ 防线一：照片校验——删除/新增照片后即使文本未改也要重扫重分类，
@@ -472,6 +486,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             saveStateCache(p, c, photos, coarse)
             // ★ P3-8：解析日志自动分类完成 → 同步生成台账行（底栏「台账 N 行」不再等导出才回填）
             buildLedger()
+            } catch (e: CancellationException) {
+                throw e   // ★ 协程取消必须重抛（结构化并发），不吞
+            } catch (e: Exception) {
+                // ★ 2026-10-31 崩溃防御：解析流水线任何未预期异常（含事件列表为空时 classify 抛
+                //   NoSuchElementException）都不得杀死应用——记录日志 + 置状态为可读错误提示
+                android.util.Log.w("Photo-Mgm", "解析日志失败", e)
+                _state.update {
+                    it.copy(busy = false, progressStage = null,
+                        message = "解析日志失败：${e.message ?: e.javaClass.simpleName}")
+                }
+            }
         }
     }
 
@@ -550,7 +575,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (mode == DedupKeepMode.KEEP_BOTH) return effective   // 都保留 = 不去重
         val dup = dupGroupsOf(s)
         val keepAlways = s.marked.values.flatMap { listOfNotNull(it.first, it.second) }.toSet()
-        return effective.mapValues { (_, ids) -> PhotoIngest.expandForKeepMode(ids, dup, mode, keepAlways) }
+        // ★ 2026-10-31 B：人工移动过的照片（overrideMap 键）作为直通集合——
+        //   三态展开不再改写它们（P1），且"保留侧代表被移走 → 整组不展示"（P2 幽灵照片 / C 冒出备份）。
+        // ★ 2026-10-31 C：passthrough 只收「真正离开原事件」的移动——
+        //   target == 原所属事件 = 原地移动（UI 上等于没动），不算人工意图；若算直通，该照片会绕过
+        //   三态过滤（KEEP_PLAIN 下"原地移动主图"会让主图与 _original 同时展示）。
+        //   target < 0（移除到未匹配）视同离开；原本在未匹配池、被移入事件（origin=null）也算离开。
+        val originEventOf = HashMap<Long, Int>()
+        for ((eventId, ids) in c.eventPhotoMap) for (pid in ids) originEventOf[pid] = eventId
+        val passthrough = s.overrideMap.filter { (pid, target) -> target < 0 || originEventOf[pid] != target }.keys
+        return effective.mapValues { (_, ids) -> PhotoIngest.expandForKeepMode(ids, dup, mode, keepAlways, passthrough) }
     }
 
     /**
@@ -578,8 +612,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun buildLedger() {
         ledgerJob?.cancel()
         ledgerJob = viewModelScope.launch(Dispatchers.Default) {
-            val rows = computeLedger(state.value) ?: return@launch
-            if (isActive) _state.update { it.copy(ledger = rows) }
+            try {
+                val rows = computeLedger(state.value) ?: return@launch
+                if (isActive) _state.update { it.copy(ledger = rows) }
+            } catch (e: CancellationException) {
+                throw e   // ★ 协程取消必须重抛（结构化并发），不吞
+            } catch (e: Exception) {
+                // ★ 2026-10-31 崩溃防御：台账重算任何未预期异常不得杀死应用
+                android.util.Log.w("Photo-Mgm", "台账生成失败", e)
+            }
         }
     }
 
@@ -756,10 +797,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
             // ★ 打包前一刻计算最终分类快照（合并人工移动/移除），台账与打包共用同一份，保证照片一致
             // ★ 2026-10-24 B1：已分类事件照片按三态展开（带水印/不带水印/都保留）；
-            //   未匹配照片不参与三态、全量保留（effectiveUnmatched 原样）
+            //   未匹配照片不参与三态、全量保留（effectiveUnmatched 原样）。
+            //   ★ 已知边界（2026-10-31）：因此「仅保留带水印」时，未匹配或被人工移除（target<0）的
+            //     _original 仍会进入 ZIP 的「未分类」文件夹。属既有设计约定（未匹配=待人工处理），
+            //     收窄未匹配池属语义变更、需产品确认，此处先标注，勿误当 bug 改。
             val finalMap = expandedEventMap(s, c, s.dedupKeepMode)
             val finalUnmatched = effectiveUnmatched(c)
             val expandedTotal = finalMap.values.flatten().size + finalUnmatched.size   // 去重后张数
+            // ★ 2026-10-31 C：记录被三态折叠/整组抑制掉的照片数——"照片怎么不见了"时的定位线索。
+            //   仅在导出一刻记一次（预览会高频重算，避免日志刷屏）。
+            if (s.dedupKeepMode != DedupKeepMode.KEEP_BOTH) {
+                val beforeCount = effectiveMap(c).values.sumOf { it.size }
+                val afterCount = finalMap.values.sumOf { it.size }
+                if (beforeCount > afterCount)
+                    android.util.Log.d("Photo-Mgm", "三态[${s.dedupKeepMode}] 折叠+整组抑制 ${beforeCount - afterCount} 张")
+            }
 
             // ★ 台账 Excel 准备（用同一个 finalMap，保证台账照片 = 实际打包的照片）
             val prep = prepareLedger(s, finalMap) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
