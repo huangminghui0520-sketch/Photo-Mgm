@@ -25,6 +25,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -138,10 +139,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * ★ 2026-10-31 审查修复：导出重入门禁（原子的 check-then-act）。
-     *   false=空闲，true=正在导出。由 exportZip 在 launch 之前 CAS 置位、在协程 finally 里复位。
+     *   false=空闲，true=正在导出。由 exportZip 在 launch 之前 CAS 置位；复位有**两处**：
+     *   协程体的 finally（正常/异常/取消路径）+ 导出 Job 的 `invokeOnCompletion`
+     *   （协程还没开始执行就被取消的路径 —— 那时 finally 根本不会跑）。
      *   不用 UiState.exportProgress 兼作门禁的原因见 exportZip 内注释（读-改-写非原子）。
+     *
+     *   `internal` 只为让测试能直接断言"取消后门禁确实释放了"。
      */
-    private val exportBusy = AtomicBoolean(false)
+    internal val exportBusy = AtomicBoolean(false)
+
+    /**
+     * 导出协程所用的调度器（E / issue #6）。
+     *
+     * ★ 默认 `Dispatchers.IO` 即生产行为；注入点存在的唯一理由是**可测性**：
+     *   原先 `viewModelScope.launch(Dispatchers.IO)` 写死，测试只能靠 `await { ... }` 轮询真实墙钟
+     *   （本机 ~7.8s 且不确定），也无法构造"协程还没开始就被取消"这种时序。
+     *   测试把它换成 `StandardTestDispatcher(testScheduler)`，配 `runTest` 精确推进虚拟时间。
+     * ★ 与 [thumbCache]、[logsTextStore] 一样用 `internal var` 注入，不动构造函数签名
+     *   （AndroidViewModelFactory 只认 `(Application)` 单参构造，见类头注释）。
+     */
+    internal var exportDispatcher: CoroutineDispatcher = Dispatchers.IO
 
     /**
      * ★ 2026-10-31 复核：导出 / 解析互斥的**另一半**（补全此前只有半边的门禁）。
@@ -898,7 +915,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (!exportBusy.compareAndSet(false, true)) return   // 已有导出在跑 → 直接丢弃本次点击
         // 同时清掉上一次结果，避免旧文案误导
         _state.update { it.copy(exportProgress = 0f, exportMessage = null, exportOk = null) }
-        viewModelScope.launch(Dispatchers.IO) {
+        // ★ E(#6)：调度器可注入（默认 Dispatchers.IO），测试用 StandardTestDispatcher 推进虚拟时间
+        val exportJob = viewModelScope.launch(exportDispatcher) {
             // ★ 2026-10-31 复核补充：进度复位与门禁释放统一收口在 finally，
             //   不再依赖"每个提前 return 都记得手写复位"（漏一处 → 导出入口永久禁用）。
             //   取消时 finally 照常执行；exportBusy.set 是原子操作，不依赖协程是否还活着。
@@ -1049,8 +1067,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(exportProgress = null) }
             }
         }
+        // ★ E(#6)：finally 只兜得住"body 至少跑过一次"的情形。协程在开始执行之前就被取消
+        //   （ViewModel 销毁、或测试里 cancel 后直接推进调度器）时 body 一次都不跑，finally 不会触发，
+        //   门禁会永远停在 true → 导出入口永久禁用且无任何提示。故再挂一层 Job 级兜底。
+        }
+        bindExportGateTo(exportJob)
     }
-}
+
+    /**
+     * 门禁与进度的 **Job 级**兜底复位（与 exportZip 里 finally 的复位互为补充，重复执行无副作用）。
+     *
+     * 为什么必须在 Job 上再挂一次：`viewModelScope.launch(...)` 之后、协程真正开始执行之前，
+     * Job 就可能被取消。此时协程体**一次都不跑**，写在体里的 finally 自然不触发 ——
+     * 门禁从此永久占用，导出按钮再也点不动。`invokeOnCompletion` 挂在 Job 生命周期上：
+     * body 跑没跑、正常结束、抛异常、被取消，都必定回调一次（对已完成 Job 注册也会立即回调）。
+     */
+    private fun bindExportGateTo(job: Job) {
+        job.invokeOnCompletion {
+            exportBusy.set(false)
+            if (state.value.exportProgress != null) {
+                _state.update { it.copy(exportProgress = null) }
+            }
+        }
+    }
 
     private fun exportDir(): File {
         val custom = state.value.outputDir
