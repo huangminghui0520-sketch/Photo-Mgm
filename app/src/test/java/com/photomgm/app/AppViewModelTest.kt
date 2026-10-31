@@ -203,28 +203,10 @@ class AppViewModelTest {
 
     // ---------- ★ 2026-10-31 审查补强：导出门禁（S3）与缓存发布（S8）的确定性用例 ----------
 
-    /**
-     * ★ S3 回归（门禁释放）：门禁是 AtomicBoolean + 协程 finally 释放。
-     *   两个必须同时成立：① 提前返回也要复位 exportProgress（否则导出入口永远显示"正在导出"）；
-     *   ② 提前返回也要释放门禁（否则第二次点击被静默吞掉，用户以为"导出没反应"）。
-     *   不需要真实照片即可判定，是全类里最稳的一条并发回归。
-     */
-    @Test
-    fun `导出提前返回后门禁与进度都被复位_可再次导出`() {
-        val vm = AppViewModel(app)
-        vm.setOutputDir(null)                 // 未设置输出目录 → 走提前返回分支
-        vm.exportZip()
-        await(vm) { it.message != null }
-        assertNotNull("未设置输出目录时应给出提示", vm.state.value.message)
-        assertTrue("提前返回必须复位 exportProgress，否则导出入口永久显示'正在导出'",
-            vm.state.value.exportProgress == null)
-
-        // ★ 关键：门禁必须已释放
-        vm.clearMessage()
-        vm.exportZip()
-        await(vm) { it.message != null }
-        assertNotNull("门禁未释放 → 第二次导出被静默吞掉（用户点不动）", vm.state.value.message)
-    }
+    // ★ E(#6)：原「S3 回归（门禁释放）」的轮询用例已迁移到 ExportGateTest，
+    //   改为 runTest + StandardTestDispatcher 驱动（不再 await 真实墙钟），判据不变。
+    //   此处保留的重入拦截用例仍需真实流水线（解析→解码→打包），其调度器尚未注入，
+    //   故暂时维持 await 方式 —— 属后续重构，不在本次小 commit 范围内。
 
     /**
      * ★ S3 回归（重入拦截）：导出进行中再次点击，必须被门禁直接丢弃。

@@ -98,6 +98,10 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testImplementation("org.junit.platform:junit-platform-launcher:1.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.10.2")
+    // ★ E(#6)：runTest / StandardTestDispatcher / Dispatchers.setMain ——
+    //   让导出门禁的时序语义（取消后释放）用虚拟时间断言，不再靠 await 轮询真实墙钟。
+    //   版本与解析出的 kotlinx-coroutines-core 对齐（1.7.3），避免混版。
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
     // Robolectric：JVM 上验证 AppViewModel 编排（parseLogs 重新粗筛→精读→自动分类）
     testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
     testImplementation("junit:junit:4.13.2")
