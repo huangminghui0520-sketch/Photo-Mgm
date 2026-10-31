@@ -3,6 +3,7 @@
 //   打开 App 时恢复关闭前的解析与分类结果，无需重跑流水线。
 package com.photomgm.app
 
+import algorithm.AppZone
 import algorithm.ClassifyResult
 import algorithm.DedupKeepMode
 import algorithm.Intervention
@@ -21,7 +22,7 @@ class SettingsStore(context: Context) {
 
     var date: LocalDate
         get() = prefs.getString(KEY_DATE, null)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
-            ?: LocalDate.now()
+            ?: LocalDate.now(AppZone.ID)
         set(v) = prefs.edit().putString(KEY_DATE, v.toString()).apply()
 
     var sourceDirs: List<String>
@@ -84,7 +85,7 @@ class SettingsStore(context: Context) {
 
     /** 事件列表缓存（ParsedLog JSON）。 */
     var parsedCache: ParsedLog?
-        get() = prefs.getString(KEY_PARSED_CACHE, null)?.let { raw ->
+        get() = if (!cacheZoneMatches()) null else prefs.getString(KEY_PARSED_CACHE, null)?.let { raw ->
             runCatching { parseParsed(raw) }.getOrNull()
         }
         set(v) = prefs.edit()
@@ -92,7 +93,7 @@ class SettingsStore(context: Context) {
 
     /** 分类结果缓存（ClassifyResult JSON）。 */
     var classifyCache: ClassifyResult?
-        get() = prefs.getString(KEY_CLASSIFY_CACHE, null)?.let { raw ->
+        get() = if (!cacheZoneMatches()) null else prefs.getString(KEY_CLASSIFY_CACHE, null)?.let { raw ->
             runCatching { parseClassify(raw) }.getOrNull()
         }
         set(v) = prefs.edit()
@@ -100,18 +101,48 @@ class SettingsStore(context: Context) {
 
     /** 照片元数据缓存（Photo[] JSON；分类的 photoId 需映射回 Photo 供导出/查看器使用）。 */
     var photosCache: List<Photo>
-        get() = prefs.getString(KEY_PHOTOS_CACHE, null)?.let { raw ->
+        get() = if (!cacheZoneMatches()) emptyList() else prefs.getString(KEY_PHOTOS_CACHE, null)?.let { raw ->
             runCatching { parsePhotos(raw) }.getOrNull()
         } ?: emptyList()
         set(v) = prefs.edit().putString(KEY_PHOTOS_CACHE, serializePhotos(v)).apply()
 
     /** 粗筛数量缓存（恢复后 ensurePipeline 视为已粗筛，跳过重扫）。 */
     var coarseCountCache: Int?
-        get() = if (prefs.contains(KEY_COARSE_CACHE)) prefs.getInt(KEY_COARSE_CACHE, 0) else null
+        get() {
+            if (!cacheZoneMatches()) return null
+            return if (prefs.contains(KEY_COARSE_CACHE)) prefs.getInt(KEY_COARSE_CACHE, 0) else null
+        }
         set(v) {
             if (v == null) prefs.edit().remove(KEY_COARSE_CACHE).apply()
             else prefs.edit().putInt(KEY_COARSE_CACHE, v).apply()
         }
+
+    /**
+     * 记录"当前派生缓存是按哪个业务时区算出来的"。
+     *
+     * ★ issue #2 一次性迁移的版本位：上面的四个派生缓存里存的是 **epoch 毫秒**，历史上是用
+     *   「当时设备的默认时区」把日志/EXIF 里的本地挂钟时间解释出来的。若当时设备不在 +08:00，
+     *   这些 epoch 就是错的，而且**无法从 epoch 反推原始挂钟**（信息已丢失）。
+     *   处置不是"换算"，而是**丢弃 + 用日志原文在 [AppZone.ID] 下重算**：
+     *   读侧发现版本位与当前业务时区不一致 → 当作没有缓存（返回 null / 空列表），
+     *   流水线随即重跑并调用本方法把版本位刷新成新值。
+     *
+     * 受影响数据（PR 里逐项列出）：
+     *   - cache_parsed / cache_classify / cache_photos / cache_coarse_count：全部丢弃重算；
+     *   - date / source_dirs / output_dir / naming_template / dedup_keep_mode / logs_text：
+     *     **原样保留**（不是时间派生数据）；
+     *   - photo_override / photo_marked：**原样保留** —— 它们的键是 MediaStore `_ID`，
+     *     重扫后 ID 不变，所以人工移动与台账标记不会丢。
+     *
+     * 回滚方案：revert 引入本方法的提交即可。版本位不匹配只影响"要不要用缓存"，
+     *   不会删除任何用户数据；回滚后缓存会按旧时区重新生成，App 仍可用。
+     */
+    fun markCacheZone() {
+        prefs.edit().putString(KEY_CACHE_ZONE, AppZone.ID.id).apply()
+    }
+
+    /** 派生缓存是否按当前业务时区算出（版本位缺失 = 旧版本数据 → 不可信）。 */
+    private fun cacheZoneMatches(): Boolean = prefs.getString(KEY_CACHE_ZONE, null) == AppZone.ID.id
 
     /** 解析时刻的日志文本快照：用于判断"日志是否被修改"——未修改时点解析只清人工移动。 */
     var parsedLogsText: String
@@ -125,6 +156,8 @@ class SettingsStore(context: Context) {
         photosCache = emptyList()
         coarseCountCache = null
         parsedLogsText = ""
+        // 清空后版本位与新写入保持一致，避免"刚清完又被判为旧版本"的反复失效
+        markCacheZone()
     }
 
     // ── JSON 序列化（Android 内置 org.json，零新依赖） ──
@@ -286,5 +319,7 @@ class SettingsStore(context: Context) {
         const val KEY_PHOTOS_CACHE = "cache_photos"
         const val KEY_COARSE_CACHE = "cache_coarse_count"
         const val KEY_PARSED_LOGS_TEXT = "cache_parsed_logs_text"
+        /** 派生缓存所用的业务时区版本位（issue #2 迁移用，见 [markCacheZone]）。 */
+        const val KEY_CACHE_ZONE = "cache_zone"
     }
 }

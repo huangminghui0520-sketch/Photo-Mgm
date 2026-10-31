@@ -2,6 +2,7 @@
 // ExifInterface 的时间格式为 "yyyy:MM:dd HH:mm:ss"（冒号分隔）；部分设备/工具写入 "yyyy-MM-dd HH:mm:ss"
 package com.photomgm.data
 
+import algorithm.AppZone
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -10,8 +11,15 @@ object ExifTimeParser {
     private val COLON = DateTimeFormatter.ofPattern("yyyy:MM:dd HH:mm:ss")
     private val DASH = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
 
-    /** 解析 EXIF 时间文本 → epoch 毫秒（含日期，@param zone 用于本地时区）；失败返回 null。 */
-    fun parse(text: String, zone: ZoneId = ZoneId.systemDefault()): Long? {
+    /**
+     * 解析 EXIF 时间文本 → epoch 毫秒（绝对时刻）。
+     *
+     * @param zone 把「相机写下的本地挂钟时间」解释成绝对时刻所用时区。
+     *             ★ EXIF 时间戳**不带时区信息**，只能按业务时区解释（默认 [AppZone.ID] 北京时间，
+     *             issue #2）。用设备默认时区会导致同一张照片在不同机器上算出不同的 epoch，
+     *             进而让事件归属随设备时区漂移。
+     */
+    fun parse(text: String, zone: ZoneId = AppZone.ID): Long? {
         val s = text.trim()
         if (s.isEmpty()) return null
         return runCatching {

@@ -16,7 +16,8 @@ import java.time.format.DateTimeFormatter
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
+/** @param zone 文件夹名里的月日/时间文本所用时区（默认北京时间，见 [AppZone]）。 */
+class ZipExporter(private val zone: ZoneId = AppZone.ID) {
 
     data class Result(
         val copied: Int,

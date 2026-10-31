@@ -330,7 +330,7 @@ private fun buildAnomalyMap(
 private val eventTimeFmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
 
 private fun fmtEventRange(start: Long?, end: Long?): String {
-    val zone = java.time.ZoneId.systemDefault()
+    val zone = algorithm.AppZone.ID
     val s = start?.let {
         java.time.Instant.ofEpochMilli(it).atZone(zone).format(eventTimeFmt)
     } ?: return ""

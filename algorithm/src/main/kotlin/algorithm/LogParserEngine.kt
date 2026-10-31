@@ -17,7 +17,8 @@ object LogParserEngine {
     private val SEQ_RE = Regex("""^(?:\d{1,2}[\.、\)）]|[(（]\d{1,2}[)）]|第\d{1,2}条|No\.?\d{1,2}|①)""")
     private val TIME_START_RE = Regex("""^(?:\d{1,2}[:时点]|(?:上午|下午|中午|傍晚)\s*[\d一二三四五六七八九十]+点|[0-5]\d{3})""")
 
-    fun parse(text: String, date: LocalDate, zone: ZoneId = ZoneId.systemDefault()): ParsedLog {
+    /** @param zone 日志里的本地挂钟时间 → 绝对时刻所用时区（默认北京时间，见 [AppZone]）。 */
+    fun parse(text: String, date: LocalDate, zone: ZoneId = AppZone.ID): ParsedLog {
         val lines = preprocess(text, date, zone)
         val events = mutableListOf<LogEvent>()
         val skipped = mutableListOf<String>()

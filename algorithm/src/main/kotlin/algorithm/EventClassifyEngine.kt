@@ -40,6 +40,12 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
         const val DEFAULT_BACKFILL_MS = 120_000L
     }
 
+    /**
+     * @param backfillMs 补拍回看容差（毫秒）
+     * @param zone 「巡查日零点」与干预提示里时间文本所用时区。
+     *             ★ 必须与解析日志用同一个 zone：解析把挂钟换成 epoch，这里把 epoch 换成
+     *             "当日零点"边界与提示文本，两侧不一致会让零点错位（issue #2）。
+     */
     fun classify(
         events: List<LogEvent>,
         clusters: List<Cluster>,
@@ -47,8 +53,8 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
         patrolDate: LocalDate,
         splitCount: Int = 0,                    // GPS 层自动拆簇次数 → CLUSTER_SPLIT 提示
         backfillMs: Long = DEFAULT_BACKFILL_MS, // 补拍回看容差（毫秒）
+        zone: ZoneId = AppZone.ID,
     ): ClassifyResult {
-        val zone = ZoneId.systemDefault()
         val sorted = events.sortedBy { it.endTimeMs ?: Long.MAX_VALUE }
         val dayStart = patrolDate.atStartOfDay().atZone(zone).toInstant().toEpochMilli()
         val pending = sorted.filter { it.startTimeMs == null }
@@ -108,7 +114,7 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
                 interventions.add(
                     Intervention(
                         Kind.TIME_OVERLAP,
-                        "事件时间穿插：${evtInfo(prev)} 与 ${evtInfo(cur)} 时间重叠，请人工核对照片归属",
+                        "事件时间穿插：${evtInfo(prev, zone)} 与 ${evtInfo(cur, zone)} 时间重叠，请人工核对照片归属",
                         assigned[cur.id]!!,
                         relatedEventIds = listOf(prev.id, cur.id),
                     ))
@@ -116,7 +122,7 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
                 interventions.add(
                     Intervention(
                         Kind.TIME_OVERLAP,
-                        "事件时间过近：${evtInfo(prev)} 与 ${evtInfo(cur)} 间隔不足 ${backfillMs * 2 / 1000} 秒，照片归属易混淆，请核对",
+                        "事件时间过近：${evtInfo(prev, zone)} 与 ${evtInfo(cur, zone)} 间隔不足 ${backfillMs * 2 / 1000} 秒，照片归属易混淆，请核对",
                         emptyList(),
                         relatedEventIds = listOf(prev.id, cur.id),
                     ))
@@ -147,7 +153,7 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
             if (assigned[e.id]!!.isEmpty() && (d.contains("拍照") || d.contains("取证"))) {
                 interventions.add(Intervention(
                     Kind.NO_PHOTO,
-                    "事件「${evtInfo(e)}」日志提到拍照/取证但无照片，可能被误归其他事件，请核对",
+                    "事件「${evtInfo(e, zone)}」日志提到拍照/取证但无照片，可能被误归其他事件，请核对",
                     emptyList(), listOf(e.id)))
             }
         }
@@ -200,8 +206,7 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
     }
 
     /** 事件摘要（编号/类型/时间区间/地点），用于干预提示明确标注核对对象。 */
-    private fun evtInfo(e: LogEvent): String {
-        val zone = ZoneId.systemDefault()
+    private fun evtInfo(e: LogEvent, zone: ZoneId): String {
         val fmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
         fun t(ms: Long?): String = ms?.let {
             java.time.Instant.ofEpochMilli(it).atZone(zone).format(fmt)
