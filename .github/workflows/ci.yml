@@ -1,7 +1,8 @@
 name: CI
 
 # 与 Build APK（build-apk.yml，只出包）分开的两类检查：
-#   1. cancellation-guard：纯 python3，几秒钟出结果，把"吞掉协程取消信号"拦在编译之前；
+#   1. static-guards：纯 python3，几秒钟出结果，在编译之前拦住两类"人肉 review 靠不住"的问题
+#      ——吞掉协程取消信号、被跳过的测试不可溯源；
 #   2. unit-test：algorithm（纯 JVM）+ app（Robolectric）单元测试。
 # ★ 必须监听 pull_request：否则分支上的检查只有推送到 main 才跑，PR 里永远是空的。
 on:
@@ -16,8 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  cancellation-guard:
-    name: Coroutine cancellation guard
+  static-guards:
+    name: Static guards
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -33,16 +34,21 @@ jobs:
         run: |
           python3 --version
           git ls-files --error-unmatch scripts/check-cancellation.py
+          git ls-files --error-unmatch scripts/check-ignore-policy.py
 
       # ★ 先跑内置样例自测：确认"判据本身没有退化"。
-      #   门禁是 300 行的自制词法分析器，没有外部依赖可对拍，最危险的回归是"规则还在、
-      #   判据失效"——表现是永远绿。自测覆盖：该报的必须报、不该报的不能报、
+      #   门禁是自制词法分析器，没有外部依赖可对拍，最危险的回归是"规则还在、判据失效"
+      #   ——表现是永远绿。自测覆盖：该报的必须报、不该报的不能报、
       #   CRLF 与 LF 判定结果完全一致（core.autocrlf 的换行差异不得影响行号/括号深度）。
       - name: 判据自测
-        run: python3 scripts/check-cancellation.py --selftest
+        run: |
+          python3 scripts/check-cancellation.py --selftest
+          python3 scripts/check-ignore-policy.py --selftest
 
       - name: 扫描 Kotlin 源码
-        run: python3 scripts/check-cancellation.py app algorithm data
+        run: |
+          python3 scripts/check-cancellation.py app algorithm data
+          python3 scripts/check-ignore-policy.py app algorithm data
 
   unit-test:
     name: Unit tests

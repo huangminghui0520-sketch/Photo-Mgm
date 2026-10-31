@@ -5,6 +5,13 @@ on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
+  # ★ 2026-10-31 新增 pull_request：main 的分支保护把「Build release APK」列为 required
+  #   status check，而本 workflow 原先**只在 main/tag 触发** —— PR 上根本不会出现这个
+  #   check，保护规则会变成"永远等不到 → 永远不能合入"的死锁。加上它，PR 上才会跑。
+  #   两个 Release 发布步骤已有 `startsWith(github.ref, 'refs/tags/'|'refs/heads/')` 条件，
+  #   PR 的 ref 是 `refs/pull/<n>/merge`，两者都不匹配 → PR 上只出包、不发布 Release。
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 # 同一分支/标签只保留最新构建，自动取消旧的运行中任务，避免重复构建浪费资源

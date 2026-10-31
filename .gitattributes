@@ -1,0 +1,12 @@
+# ★ CI 检查脚本必须**字节一致**地检出。
+#
+#   本机 core.autocrlf=true：Windows 检出会把 LF 转成 CRLF。Python 能解析 CRLF 源码，
+#   但 scripts/ 下的脚本是"用字符串样例当输入"的门禁——样例文本里会混入 \r，
+#   于是"本地跑得通、CI 跑不通"又多一个来源（本轮已实测：两个脚本在 CRLF 下自测
+#   都通过，但这是**结果**，不该依赖运气）。
+#   强制 LF，任何平台 checkout 出来的字节都一样。
+scripts/*.py text eol=lf
+
+# 工作流同理：GitHub Actions 容忍 CRLF，但一旦换行不一致，
+# 每次改动都会变成整文件重写，diff 完全失去可读性。
+.github/workflows/*.yml text eol=lf
