@@ -58,11 +58,13 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
+import com.photomgm.app.ThumbnailSpec
 import algorithm.model.Photo
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -164,6 +166,9 @@ internal fun ViewerContent(
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
+                // W5(#3)：大图预览**故意**不走 ThumbnailSpec，保持 bare ref 让 Coil 按容器尺寸
+                // 自动算缓存键 —— 它要的是清晰大图，与缩略图本就是两份不同尺寸的缓存，
+                // 各自带尺寸维度才不会互相覆盖（裸 ref 键正是当初把尺寸维度挤掉的原因）。
                 AsyncImage(
                     model = photo.sourceRef,
                     contentDescription = photo.displayName,
@@ -331,6 +336,12 @@ internal fun ViewerContent(
                     photos.forEachIndexed { idx, p ->
                         val isCur = idx == pagerState.currentPage
                         val hasAnomaly = anomalies.containsKey(p.id)
+                        // ★ W5(#3)：LocalContext.current 是 @Composable 读，而 remember 的 calculation
+                        //   带 @DisallowComposableCalls —— 必须在外面先取 context，不能写进 lambda 里。
+                        val ctx = LocalContext.current
+                        val thumbReq = remember(ctx, p.sourceRef) {
+                            ThumbnailSpec.request(ctx, p.sourceRef)
+                        }
                         Box(
                             Modifier
                                 .width(44.dp)
@@ -346,8 +357,10 @@ internal fun ViewerContent(
                                     scope.launch { pagerState.scrollToPage(idx) }
                                 },
                         ) {
+                            // W5(#3)：胶片条与事件网格共用 ThumbnailSpec 的尺寸/缓存键 ——
+                            // 只有两边逐字段一致，预加载写进内存缓存的那份才可能被这里命中。
                             AsyncImage(
-                                model = p.sourceRef,
+                                model = thumbReq,
                                 contentDescription = p.displayName,
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop,
