@@ -101,9 +101,11 @@ class ThumbnailCacheWiringTest {
      *
      *   ★ 之所以用 @Ignore 而不是删掉：这条判据的形状就是"memoryCacheKey 坑"——
      *   修 W5 时若只加了 size 却仍保留裸 ref 键（或反之），本用例依然红，能挡住半吊子修法。
-     *   修复后删除 @Ignore 即可变绿。
+     *   ★ 本仓约定：@Ignore 必须带「原因 + issue 编号」，由 scripts/check-ignore-policy.py
+     *   在 CI 强制；修复后删除 @Ignore 即可变绿。
      */
-    @Ignore("W5：preload 未显式限定解码尺寸（依赖 Coil 默认的整屏尺寸解析器），修复后启用本用例")
+    @Ignore("W5(#3): preload 未显式 .size(w,h)，且 memoryCacheKey(ref) 把尺寸维度挤出缓存键；" +
+        "修复须同时加尺寸与尺寸化缓存键（去掉裸 ref 键或把尺寸拼进 key），修复后删除本注解")
     @Test
     fun `预加载请求必须显式限定解码尺寸_不能依赖默认解析器`() {
         val req = CoilThumbnailCache(app()).buildRequest("/sdcard/DCIM/Camera/a.jpg")

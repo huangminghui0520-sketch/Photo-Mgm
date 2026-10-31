@@ -49,16 +49,21 @@ class ImageUtilsOwnershipTest {
         return bmp
     }
 
-    /** 正常路径：400×300 恰好 4:3 → 应产出字节，且入参位图被回收（process 接管所有权）。 */
+    /**
+     * 正常路径：400×300 恰好 4:3 → 应产出字节。
+     *
+     * ★ 这里**故意不断言** `bmp.isRecycled`（2026-10-31 复核后移除）。
+     *   理由：4:3 全幅裁剪时 `Bitmap.createBitmap(src, 0, 0, w, h)` 在 Robolectric LEGACY 下
+     *   返回的就是入参本身（cropped === bmp），而正常出口**在修复前就已经回收**了 bmp
+     *   —— 失败证明（去掉 finally 里的 recycle）显示本用例**照样通过**，对 S9 零区分度。
+     *   留着它只会让人误以为"回收已被覆盖"，实际兜住回收的是下面两条失败分支用例。
+     *   本条的价值在另一处：钉住 4:3 输入确实能产出字节（缩放/压缩链路没被改坏）。
+     */
     @Test
-    fun `正常路径_产出字节且入参位图被回收`() {
+    fun `正常路径_产出JPEG字节`() {
         val bmp = Bitmap.createBitmap(400, 300, Bitmap.Config.ARGB_8888)
         val out = ImageUtils.processBitmap(bmp)
         assertNotNull("400×300 恰好 4:3，应产出 JPEG 字节", out)
-        assertTrue(
-            "process 必须在成功出口也回收它接管的位图（S9 所有权契约）",
-            bmp.isRecycled,
-        )
     }
 
     /**
@@ -108,4 +113,3 @@ class ImageUtilsOwnershipTest {
         assertTrue("原图必须已回收", bmp.isRecycled)
     }
 }
-
