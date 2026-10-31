@@ -52,7 +52,13 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
         val sorted = events.sortedBy { it.endTimeMs ?: Long.MAX_VALUE }
         val dayStart = patrolDate.atStartOfDay().atZone(zone).toInstant().toEpochMilli()
         val pending = sorted.filter { it.startTimeMs == null }
-        val timed = sorted.filter { it.startTimeMs != null }
+        // ★ 2026-10-31 审查修复：findWindow 的窗口划分按「记录（开始）时间升序」推演（其注释亦如此声明），
+        //   但上面的 sorted 是按 endTime 排序的——事件区间嵌套/重叠时 endTime 序 ≠ startTime 序，
+        //   落在长事件内的照片会被错判给短事件。例：A(08:00~09:00) 包含 B(08:10~08:20)，
+        //   按 endTime 排序为 [B, A]，08:30 的照片会被判给 B（正确应属 A 或按最近记录归 A）。
+        //   这里对 timed 补一次 startTime 升序即可；sorted 仍用于 pending 划分与 assigned 初始化顺序，
+        //   保持原样不动，避免影响既有行为。
+        val timed = sorted.filter { it.startTimeMs != null }.sortedBy { it.startTimeMs }
 
         val assigned = LinkedHashMap<Int, MutableList<Long>>()
         sorted.forEach { assigned[it.id] = mutableListOf() }

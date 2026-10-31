@@ -17,8 +17,6 @@ import algorithm.model.LogEvent
 import android.app.Application
 import android.content.ContentUris
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
 import android.util.Log
@@ -41,7 +39,9 @@ import java.io.File
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 data class UiState(
     val date: LocalDate = LocalDate.now(),
@@ -68,6 +68,12 @@ data class UiState(
     val exportProgress: Float? = null,
     /** 导出完成信息（§7.4 完成页「成功N/失败M」） */
     val exportMessage: String? = null,
+    /**
+     * ★ 2026-10-31 审查修复：本次导出是否成功（null=尚未导出过）。
+     *   [exportMessage] 在成功与失败时都非 null，底栏无法据此区分；失败却显示「导出完成 ✓」
+     *   会让用户误以为产物已生成并据此外发。本字段是唯一的成功/失败判据。
+     */
+    val exportOk: Boolean? = null,
     /** 最近一次导出文件（用户可见位置：content:// 或本地路径），供「打开」入口 */
     val lastExport: String? = null,
 )
@@ -121,12 +127,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var ledgerJob: Job? = null
 
     /**
-     * ★ P2-2：dupGroupsOf 结果缓存——照片 List 引用未变（集合未变）则复用，
-     * 避免三态切换/预览/导出每次全量 O(n²) 重算。groupDupContent 为纯函数（幂等），
-     * 跨线程引用赋值原子；@Volatile 保证可见性，最坏情况是重复计算一次、结果一致。
+     * ★ 2026-10-31 审查修复：导出重入门禁（原子的 check-then-act）。
+     *   false=空闲，true=正在导出。由 exportZip 在 launch 之前 CAS 置位、在协程 finally 里复位。
+     *   不用 UiState.exportProgress 兼作门禁的原因见 exportZip 内注释（读-改-写非原子）。
      */
-    @Volatile private var dupGroupsCacheRef: List<Photo>? = null
-    @Volatile private var dupGroupsCacheResult: Map<Long, List<Photo>> = emptyMap()
+    private val exportBusy = AtomicBoolean(false)
+
+    /**
+     * ★ 2026-10-31 复核：导出 / 解析互斥的**另一半**（补全此前只有半边的门禁）。
+     *
+     *   已有的一半：exportZip 开头检查 `state.value.busy` —— 解析流水线跑着就不许导出。
+     *   缺失的一半："导出跑着就不许重启解析"。不补全的后果：导出过程中改日期/改源目录/点解析，
+     *   流水线会把 photos / classify / ledger 清空重算，而导出协程手里握的是**入口时抓的快照 s**，
+     *   仍按 s.photos 逐张读盘打包——于是 ZIP 与界面、与台账三方不再对应；更糟的是断点续传
+     *   状态文件按日期命名，新旧两批照片会在同一份续传状态里交叉，下次导出跳过本该打包的照片。
+     *
+     *   ★ 判据用 [exportBusy] 而不是 state.value.exportProgress：后者是**UI 状态**，
+     *     提前返回分支会把它置 null，语义是"进度显示"，不是"是否正在导出"。
+     *   ★ 只做同步判断 + 提示，不引入锁：解析与导出各跑各的协程，这里只是拒绝"启动"这一刻，
+     *     成本是一次 volatile 读。
+     *
+     * @return true = 被导出挡住，调用方应直接 return（不启动流水线）
+     */
+    private fun blockedByExport(): Boolean {
+        if (!exportBusy.get()) return false
+        _state.update { it.copy(message = "导出进行中，请等待导出完成后再操作") }
+        return true
+    }
+
+    /**
+     * ★ P2-2：dupGroupsOf 结果缓存——照片 List 引用未变（集合未变）则复用，
+     *   避免三态切换/预览/导出每次全量 O(n²) 重算。groupDupContent 为纯函数（幂等），
+     *   重复计算一次的结果一致。
+     *
+     * ★ 2026-10-31 审查修复：ref 与 result 封装成**不可变** [DupGroupsCache]，
+     *   用单个 [AtomicReference] 整体替换——一次引用赋值发布，读侧永远拿到一致快照。
+     *   原实现是「ref / result 两个独立 @Volatile 字段」：写入顺序为 ref 先、result 后，
+     *   而 previewEventMap 在 UI 线程、导出在 IO 线程并发调用——线程 A 写完 ref 尚未写 result 时，
+     *   线程 B 看到 ref 相同就会返回**上一批照片**的分组结果，三态展开据此算出错的 keep/drop 集合
+     *   （台账与 ZIP 照片错乱）。
+     *   ★ 注：@Volatile + 不可变对象本就已构成安全发布（与 AtomicReference.set 等价），
+     *     改用 AtomicReference 是为了让"整体原子替换"的意图显式化，并为将来改成
+     *     compareAndSet 的失效策略留出接口；当前行为不变。
+     */
+    private data class DupGroupsCache(
+        val ref: List<Photo>,
+        val result: Map<Long, List<Photo>>,
+    )
+    private val dupGroupsCache = AtomicReference<DupGroupsCache?>(null)
 
     /** ★ 单日照片缓存（进程内）：只保留**当前巡查日期**一份，换日期即覆盖（2026-10-07 采纳建议）。
      *   跨进程重启由 SettingsStore 状态缓存兜底。 */
@@ -220,6 +268,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 变更即触发；取消旧任务防止快速连续操作导致旧结果覆盖新结果。
      */
     private fun autoPipeline() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重启扫描流水线）
+        if (blockedByExport()) return
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -406,6 +456,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *   旧 classify 引用已删照片 URI → 事件网格显示灰色方块缩略图。
      */
     fun parseLogs() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重启解析流水线）
+        if (blockedByExport()) return
         val s = state.value
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
@@ -517,21 +569,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- 分类 + 台账（§5/§6/§7） ----------
-    fun runClassify() = viewModelScope.launch(Dispatchers.Default) {
-        if (state.value.busy) return@launch
-        val s = state.value
-        val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
-        if (s.photos.isEmpty()) { _state.update { it.copy(message = "无照片（请先粗筛并精读）") }; return@launch }
-        // ★ 2026-10-07 修复：手动「生成分类」= 全新分配，上一批人工移动（overrideMap）作废
-        store.overrideMap = emptyMap()
-        _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
-        val g = AlgorithmApi.gpsGroup(s.photos)
-        val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
-        _state.update { it.copy(classify = c, busy = false, progressStage = null) }
-        // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
-        saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
-        // ★ P3-8：手动分类完成 → 同步刷新台账行
-        buildLedger()
+    fun runClassify() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重算分类，否则导出手里的快照与状态错位）
+        if (blockedByExport()) return
+        viewModelScope.launch(Dispatchers.Default) {
+            if (state.value.busy) return@launch
+            val s = state.value
+            val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
+            if (s.photos.isEmpty()) { _state.update { it.copy(message = "无照片（请先粗筛并精读）") }; return@launch }
+            // ★ 2026-10-07 修复：手动「生成分类」= 全新分配，上一批人工移动（overrideMap）作废
+            store.overrideMap = emptyMap()
+            _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
+            val g = AlgorithmApi.gpsGroup(s.photos)
+            val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
+            _state.update { it.copy(classify = c, busy = false, progressStage = null) }
+            // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
+            saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
+            // ★ P3-8：手动分类完成 → 同步刷新台账行
+            buildLedger()
+        }
     }
 
     /**
@@ -559,10 +615,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun dupGroupsOf(s: UiState): Map<Long, List<Photo>> {
         val photos = s.photos
-        if (dupGroupsCacheRef === photos) return dupGroupsCacheResult
+        // ★ 读侧（2026-10-31 复核点）：**只 get() 一次**，拿到的是一个不可变快照对象，
+        //   再从这同一个对象上取 ref 与 result —— 两者必然同生共死。
+        //   ⚠ 严禁写成下面这种两次 get() 的形式：
+        //       if (dupGroupsCache.get()?.ref === photos) return dupGroupsCache.get()!!.result
+        //     两次 get() 之间缓存可能已被别的线程整体替换，于是"新 photos 配旧 result"，
+        //     写侧的一次性原子发布就被读侧抵消了（症状与修复前完全一样，且更难复现）。
+        val snapshot = dupGroupsCache.get()
+        if (snapshot != null && snapshot.ref === photos) return snapshot.result
         val g = PhotoIngest.groupDupContent(photos, dedupConfig())
-        dupGroupsCacheRef = photos
-        dupGroupsCacheResult = g
+        // ★ 一次引用赋值发布（ref 与 result 同生共死），杜绝"ref 已更新、result 仍陈旧"的中间态
+        dupGroupsCache.set(DupGroupsCache(photos, g))
         return g
     }
 
@@ -733,6 +796,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val imgDebug = "图片:成功${ok.get()}/失败${fail.get()}" +
                 if (failures.isNotEmpty()) " 失败[${failures.joinToString(",")}]" else ""
             Triple(rows, bytesCache, imgDebug)
+        } catch (e: CancellationException) {
+            // ★ 2026-10-31 审查修复：取消必须重抛（同 exportZip）。
+            //   否则协程已取消，本函数却返回 null 让 exportZip 继续跑完剩余的图片解码与打包。
+            throw e
         } catch (e: Exception) {
             // ★ P3-9：记录异常（此前静默吞错，真机"台账未生成"无日志可查）
             android.util.Log.w("Photo-Mgm", "prepareLedger 失败（台账未生成）", e)
@@ -774,17 +841,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 导出 ZIP：按事件分类文件夹打包（命名模板由设置页选择），未匹配→未分类（§7.4）。
      *  ★ 2026-09-08 需求：压缩包同时包含 照片分类文件夹 + 台账 Excel（extraFiles 打入 ZIP）。
      *  核心 ZipExporter 仅收 File（PC 可移植）→ Android 侧先写临时文件，再复制到输出目标（SAF/路径）。 */
-    fun exportZip() = viewModelScope.launch(Dispatchers.IO) {
-        if (state.value.busy) return@launch
-        val s = state.value
-        // ★ 修复：未设置输出目录禁止导出
-        if (s.outputDir.isNullOrBlank()) {
-            _state.update { it.copy(message = "未设置输出目录，请先在「设置」页选择或输入输出目录后再导出") }
-            return@launch
-        }
-        val c = s.classify ?: run { _state.update { it.copy(message = "请先在预览页生成分类") }; return@launch }
-        val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
-        _state.update { it.copy(exportProgress = 0f) }
+    fun exportZip() {
+        // ★ 2026-10-31 审查修复：导出重入门禁，且必须在 launch 之外**同步**完成。
+        //   原实现把 check-then-act 放在协程体内（Dispatchers.IO），两次快速点击会先后通过检查：
+        //   两个导出协程共用同一个 tmpZip（文件名精确到秒，同秒同名）与同一个 stateFile，
+        //   先结束者执行 tmpZip.delete() 会删掉对方正在写的文件 → ZIP 损坏或"导出失败"，
+        //   断点续传状态也会互相覆盖。busy 只由解析流水线置位、导出期间为 false，拦不住重入。
+        //
+        // ★ 2026-10-31 复核补充：门禁改用 [exportBusy].compareAndSet 做**原子** check-then-act。
+        //   原写法是「读 state.value → _state.update」两步：StateFlow 各自的读/写是原子的，
+        //   但两步之间不是——若 exportZip 将来被非主线程调用（如外部触发），仍有并发窗口。
+        //   CAS 把"检查 + 置位"压成一个操作，跨线程、跨调用点都成立，且不引入锁。
+        //   门禁内**不含任何 IO**：只读内存态 state.value、写 StateFlow、CAS 布尔量，
+        //   因此放在调用线程（主线程）执行无卡顿风险。
+        //
+        //   ★ 为何没有把 UiState.busy 本身改成 AtomicBoolean：busy 是 UI 状态，被
+        //     AppNav / LogInputSection / UnifiedScreen 直接读取渲染，改成原子量会穿透到
+        //     UI 层并破坏状态提升（state 必须是不可变快照）。它的可见性由 MutableStateFlow
+        //     保证（update 是 CAS 循环、value 读取拿到最新引用），作为**判据**是安全的；
+        //     真正的"互斥"由 exportBusy 承担。
+        if (state.value.busy) return
+        if (!exportBusy.compareAndSet(false, true)) return   // 已有导出在跑 → 直接丢弃本次点击
+        // 同时清掉上一次结果，避免旧文案误导
+        _state.update { it.copy(exportProgress = 0f, exportMessage = null, exportOk = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            // ★ 2026-10-31 复核补充：进度复位与门禁释放统一收口在 finally，
+            //   不再依赖"每个提前 return 都记得手写复位"（漏一处 → 导出入口永久禁用）。
+            //   取消时 finally 照常执行；exportBusy.set 是原子操作，不依赖协程是否还活着。
+            try {
+            val s = state.value
+            // ★ 修复：未设置输出目录禁止导出（★ 提前返回必须复位 exportProgress，否则导出入口永久禁用）
+            if (s.outputDir.isNullOrBlank()) {
+                _state.update {
+                    it.copy(message = "未设置输出目录，请先在「设置」页选择或输入输出目录后再导出",
+                        exportProgress = null)
+                }
+                return@launch
+            }
+            val c = s.classify ?: run {
+                _state.update { it.copy(message = "请先在预览页生成分类", exportProgress = null) }; return@launch
+            }
+            val parsed = s.parsed ?: run {
+                _state.update { it.copy(message = "请先解析日志", exportProgress = null) }; return@launch
+            }
         // ★ 2026-10-08 P0-3：临时文件声明移到 try 外——导出失败也必须清理（含原图，可达几十 MB）
         val fileName = "照片分类_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_" +
                 java.time.LocalDateTime.now()
@@ -817,7 +916,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val prep = prepareLedger(s, finalMap) { frac -> _state.update { it.copy(exportProgress = 0.6f * frac) } }
             val xlsxBytes = prep?.let { (rows, cache, _) ->
                 val bos = ByteArrayOutputStream()
-                runCatching { AlgorithmApi.exportLedgerXlsx(rows, bos) { ref -> cache[ref] } }
+                // ★ 2026-10-31：协程体内改用 runCatchingCancellable（取消信号不被吞）。
+                //   本处包裹的是非 suspend 调用，今天不会抛取消；但它是导出协程里最重的一步，
+                //   将来一旦加入挂起点（如切线程写盘）就会静默复现 S1，故按统一约定写。
+                runCatchingCancellable { AlgorithmApi.exportLedgerXlsx(rows, bos) { ref -> cache[ref] } }
                     .getOrNull()?.let { bos.toByteArray() }
             }
             // ★ 台账文件名含巡查日期 + 时分秒：区分"导出时刻"与"巡查日期"，
@@ -829,7 +931,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // ★ 2026-10-18 P0-2：台账 xlsx 单独落缓存（App 外部私有目录，FileProvider 可打开），
             //   供导出后「打开台账」直接打开；ZIP 内的 xlsx 不便直开。台账失败时为 null。
             val xlsxCachePath = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) {
-                runCatching {
+                runCatchingCancellable {
                     val dir = File(getApp().getExternalFilesDir(null), "export").apply { mkdirs() }
                     val f = File(dir, xlsxName)
                     f.writeBytes(xlsxBytes)
@@ -844,7 +946,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // ★ 2026-10-18 P0-2：copyToOutput 返回 null = 输出目录不可写，结果里需提示；
             //   tmpZip 无论是否复制统一清理（断点续传跳过时也会残留空文件）。
             val shown = if (r.copied > 0 || r.failed > 0) copyToOutput(tmpZip, fileName) else null
-            runCatching { tmpZip.delete() }
+            // ★ 2026-10-31：协程体内一律用 runCatchingCancellable（三处 tmpZip 清理统一）。
+            //   delete() 是非挂起调用，今天不会抛取消；统一写法的好处是 CI 规则零例外，
+            //   将来谁在这里插入一个挂起调用，取消语义仍是对的。
+            runCatchingCancellable { tmpZip.delete() }
             val skipNote = if (r.skippedFromState > 0) "（跳过已完成 ${r.skippedFromState}）" else ""
             val writeNote = if (r.copied > 0 && shown == null) "（输出目录不可写）" else ""
             // ★ 2026-10-18 P0-3：打包失败明细摘要（前 2 条 + 总数），让用户知道缺了哪些照片、为什么
@@ -860,11 +965,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } else {
                 "（台账未生成：${prep?.third ?: "准备失败"}）"
             }
+            // ★ 2026-10-31 审查修复：成功判据——正常打包且写出到输出目录，或断点续传判定已完成
+            //   （ZipExporter 跳过前已校验产物存在）。输出目录不可写（shown=null）仍属失败，
+            //   不能因为"没抛异常"就报成功。
+            val ok = (r.copied > 0 && shown != null) || r.skippedFromState > 0
             _state.update {
                 it.copy(
                     // ★ 2026-10-24 B1：导出消息附去重后张数（三态展开后的实际打包数）
                     exportMessage = "ZIP 导出：成功 ${r.copied} / 失败 ${r.failed}（去重后共 $expandedTotal 张）$failNote$skipNote$xlsxNote$writeNote",
                     exportProgress = null,
+                    exportOk = ok,
+                    // ★ 2026-10-31：失败时一并把原因送进 Snackbar 通道（底栏只有一行，放不下失败明细），
+                    //   否则界面只在底栏标红、用户拿不到任何可执行的信息。成功时不动既有提示。
+                    message = if (ok) it.message else
+                        "ZIP 导出未完成：${if (shown == null) "输出目录不可写，请在设置中重新选择" else "有照片未打包，请查看底栏明细"}",
                     // ★ 回填台账行：底部操作条要显示「台账 N 行」，也需要它判断导出完成。
                     //   以前此处不回填，导致 state.ledger 永远为 null、底栏永远显示"台账待生成"。
                     ledger = prep?.first ?: it.ledger,
@@ -873,12 +987,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     lastExport = xlsxCachePath,
                 )
             }
+        } catch (e: CancellationException) {
+            // ★ 2026-10-31 审查修复：取消必须重抛（结构化并发）。
+            //   JVM 上 kotlinx.coroutines.CancellationException 是 java.util.concurrent.CancellationException
+            //   的 typealias，继承 IllegalStateException → 会被下方 catch (Exception) 吞掉：
+            //   协程已取消却仍把状态写成"ZIP 导出失败"，外层也感知不到取消。
+            //   与 autoPipeline / parseLogs / buildLedger 的处理保持一致。
+            runCatchingCancellable { tmpZip.delete() }
+            _state.update { it.copy(exportProgress = null) }
+            throw e
         } catch (e: Exception) {
             // ★ 2026-10-08 P0-3：失败也清理临时 ZIP（可能含全部原图，几十 MB）
-            runCatching { tmpZip.delete() }
-            _state.update { it.copy(exportMessage = "ZIP 导出失败：${e.message}", exportProgress = null) }
+            runCatchingCancellable { tmpZip.delete() }
+            _state.update {
+                it.copy(exportMessage = "ZIP 导出失败：${e.message}", exportProgress = null, exportOk = false)
+            }
+        }
+        } finally {
+            // ★ 2026-10-31 复核补充：**外层** try 的唯一出口释放门禁。
+            //   必须包住提前 return 的分支（未设输出目录 / 未生成分类 / 未解析日志），否则这些分支
+            //   return 后 exportBusy 永远不释放 → 导出按钮再也点不动（比原 bug 更隐蔽）。
+            //   同时兜住 Error/Throwable：catch(Exception) 抓不到 OOM，此前会让 exportProgress
+            //   卡在非 null，导出永久不可用且无任何提示。
+            exportBusy.set(false)
+            if (state.value.exportProgress != null) {
+                _state.update { it.copy(exportProgress = null) }
+            }
         }
     }
+}
 
     private fun exportDir(): File {
         val custom = state.value.outputDir
@@ -923,41 +1060,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(marked = map) }
     }
 
-    // ---------- 台账照片字节供给（§7.3 Excel 嵌入照片） ----------
-
-    /**
-     * 台账照片读取：sourceRef（物理路径 / content uri）→ 原图字节 → 压缩小图（≤480px JPEG85），
-     * 控制 xlsx 体积。读不到返回 null（该照片单元格只留文件名）。
-     */
-    private fun readPhotoBytes(ref: String): ByteArray? {
-        val raw = runCatching {
-            if (ref.startsWith("content://")) {
-                getApp().contentResolver.openInputStream(Uri.parse(ref))?.use { it.readBytes() }
-            } else File(ref).inputStream().use { it.readBytes() }
-        }.getOrNull() ?: return null
-        return compressForExcel(raw)
-    }
-
-    private fun compressForExcel(bytes: ByteArray): ByteArray {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return bytes
-        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
-        var sample = 1
-        while (maxDim / (sample * 2) >= 480) sample *= 2
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return bytes
-        val scaled = if (bmp.width > 480 || bmp.height > 480) {
-            val s = 480f / maxOf(bmp.width, bmp.height)
-            Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt().coerceAtLeast(1),
-                (bmp.height * s).toInt().coerceAtLeast(1), true)
-        } else bmp
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
-        if (scaled !== bmp) bmp.recycle()
-        scaled.recycle()
-        return out.toByteArray()
-    }
+    /** ★ 2026-10-31 审查：原「台账照片字节供给」段（readPhotoBytes / compressForExcel）已删除。
+     *  全仓库无任何调用方（台账图片实际走 prepareLedger → ImageUtils.process），属死代码；
+     *  且它与现行实现重复定义了一套压缩参数（480px JPEG85 vs 400×300 JPEG50），
+     *  留着会误导后续维护者改错地方。 */
 
     /** 合并 overrideMap 后的事件照片表（§8.3 移动兜底）。target=-1（移除）→ 从所有事件移除、不归入任何事件。 */
     fun effectiveMap(c: ClassifyResult): Map<Int, List<Long>> {

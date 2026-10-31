@@ -347,4 +347,72 @@ class XlsxWriterTest {
         val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
         assertTrue(!sheet.contains("<drawing"))
     }
+
+    /**
+     * ★ 2026-10-31 审查回归：Excel/WPS 行高规范上限为 **409.5pt**。
+     *   数据行写的是 customHeight="1"（禁止 Excel 自动收敛），ht 一旦超限，打开时会触发
+     *   「发现部分内容有问题」的修复提示，修复失败则整份台账不可用。
+     *   日志含 23 个换行段时估算值即达 413pt（空段也各计 1 行，很容易达到）。
+     */
+    @Test fun `超长日志的行高被钳制在Excel上限内`() {
+        // 60 个换行段：未钳制时 (60*16+8)*1.1 ≈ 1064pt
+        val longDesc = (1..60).joinToString("\n") { "第${it}段检查内容" }
+        val bytes = ByteArrayOutputStream().also { XlsxWriter.write(listOf(row(desc = longDesc)), it) }.toByteArray()
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        val ht = Regex("""<row r="2" ht="(\d+)"""").find(sheet)?.groupValues?.get(1)?.toInt()
+            ?: error("数据行未写 ht，无法校验行高")
+        assertTrue(ht <= 409, "行高 $ht 超过 Excel 上限 409.5pt（会触发修复提示、可能导致整表不可用）")
+    }
+
+    // ---- ★ 2026-10-31 W1：不可识别格式不得谎报为 png（与 F1 同属"台账打不开"故障面） ----
+
+    /** WebP 文件头：RIFF + size + "WEBP"。 */
+    private val webp = byteArrayOf(0x52, 0x49, 0x46, 0x46, 0x1A, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50)
+
+    /** HEIC 文件头：size + "ftyp" + 主 brand "heic"。 */
+    private val heic = byteArrayOf(0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70,
+        0x68, 0x65, 0x69, 0x63, 0x00, 0x00, 0x00, 0x00)
+
+    @Test fun `WebP字节不被嵌入_且不被声明为png`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(p1 = "a.webp")), it) { _ -> webp }
+        }.toByteArray()
+        val names = entries(bytes).map { it.first }
+        assertTrue(names.none { it.startsWith("xl/media/") }, "WebP 不得生成 media 部件")
+        assertTrue("xl/drawings/drawing1.xml" !in names, "无图则不应有 drawing")
+        val ct = entries(bytes).first { it.first == "[Content_Types].xml" }.second
+        assertTrue(!ct.contains("""ContentType="image/png""""), "不得声明 image/png")
+        // 退化为文件名：照片列仍要写文件名，信息不丢
+        val sheet = entries(bytes).first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(sheet.contains(">a.webp<"), "照片列应退化为文件名")
+    }
+
+    @Test fun `HEIC字节不被嵌入_且不被声明为png`() {
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(p1 = "a.heic")), it) { _ -> heic }
+        }.toByteArray()
+        val names = entries(bytes).map { it.first }
+        assertTrue(names.none { it.startsWith("xl/media/") }, "HEIC 不得生成 media 部件")
+        val ct = entries(bytes).first { it.first == "[Content_Types].xml" }.second
+        assertTrue(!ct.contains("""ContentType="image/png""""), "不得声明 image/png")
+    }
+
+    /** 跳过不可嵌入的照片后，剩余图片的 media 编号必须连续（image1 起），否则 rels 指向空部件。 */
+    @Test fun `跳过不可嵌入格式后_剩余图片编号连续`() {
+        val jpg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(), 0x00, 0x10,
+            0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0xFF.toByte(), 0xD9.toByte())
+        val loader: (String?) -> ByteArray? = { ref ->
+            if (ref?.endsWith(".webp") == true) webp else jpg
+        }
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.write(listOf(row(p1 = "a.webp", p2 = "b.jpg")), it, loader)
+        }.toByteArray()
+        val names = entries(bytes).map { it.first }
+        assertTrue("xl/media/image1.jpg" in names, "JPEG 应作为 image1 写入（编号连续）")
+        assertTrue("xl/media/image2.jpg" !in names, "不得残留 image2")
+        val rels = entries(bytes).first { it.first == "xl/drawings/_rels/drawing1.xml.rels" }.second
+        assertTrue(rels.contains("""Target="../media/image1.jpg""""), "rels 必须指向 image1")
+        val drawing = entries(bytes).first { it.first == "xl/drawings/drawing1.xml" }.second
+        assertTrue(drawing.contains("""<xdr:from><xdr:col>6</xdr:col>"""), "被嵌入的是第 2 张（G 列）")
+    }
 }

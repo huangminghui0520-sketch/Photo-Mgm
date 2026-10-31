@@ -40,6 +40,21 @@ class EventClassifyEngineTest {
         assertTrue(r.eventPhotoMap[2]!!.isEmpty())
     }
 
+    /**
+     * ★ 2026-10-31 审查回归：事件区间**嵌套**时（长事件包含短事件）不得因排序键错位而归错事件。
+     *   findWindow 按"记录（开始）时间升序"推演，但传入的 timed 此前是按 endTime 排序的
+     *   （[短事件 08:20, 长事件 09:00]），于是 08:30 的照片被判给记录时间 08:10 的短事件；
+     *   08:30 实际落在长事件区间内，应归长事件。
+     */
+    @Test fun `区间嵌套时照片归区间覆盖它的事件`() {
+        val long1 = ev(1, at(8, 0), at(9, 0), "长事件")     // 记录 08:00，结束 09:00（覆盖 08:30）
+        val short1 = ev(2, at(8, 10), at(8, 20), "短事件")   // 记录 08:10，结束 08:20（不覆盖 08:30）
+        val c = cluster(11, at(8, 30))
+        val r = engine.classify(listOf(long1, short1), listOf(c), emptyList(), date)
+        assertTrue(r.eventPhotoMap[1]!!.contains(11L), "08:30 落在长事件区间内 → 归长事件（此前误归短事件）")
+        assertTrue(r.eventPhotoMap[2]!!.isEmpty())
+    }
+
     @Test fun `边界_照片时间等于本条记录时间归本条事件_补拍回看`() {
         // 照片 08:15 == E2 记录时间 → 补拍回看 0 秒 → 归 E2（2026-10-01 规则变更：不再推给下一事件）
         val e1 = ev(1, at(8, 0), at(8, 0), "交接班")

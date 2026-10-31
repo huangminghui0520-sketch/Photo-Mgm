@@ -134,7 +134,11 @@ fun LogSection(
         } else {
             // ★ 2026-10-24 B1：预览用三态展开后的事件照片表（含人工移动），与导出一致；
             //   remember key 含 dedupKeepMode —— 三态切换即时重建卡片照片数与缩略图
-            val effective = remember(classify, state.overrideMap, state.dedupKeepMode) {
+            // ★ 2026-10-31 审查修复：key 必须含 state.marked —— expandedEventMap 会把 marked 展平为
+            //   keepAlways（三态优先级最高，能把被折叠掉的照片重新纳入结果）。此前 key 只有
+            //   classify / overrideMap / dedupKeepMode，在弹窗里「设为台账」后 marked 变了而这三者都没变，
+            //   remember 返回旧 Map → 卡片照片数与缩略图停留在标记前，与弹窗内实时算出的视图不一致。
+            val effective = remember(classify, state.overrideMap, state.dedupKeepMode, state.marked) {
                 vm.previewEventMap(classify)
             }
             val effectiveUnmatched = remember(classify, state.overrideMap) { vm.effectiveUnmatched(classify) }

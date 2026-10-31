@@ -201,6 +201,32 @@ class PhotoIngestTest {
         assertEquals("IMG_20260925_080504149.jpg", out[1].displayName, "压缩版被其主图替换")
     }
 
+    /**
+     * ★ 2026-10-31 审查回归：不同目录下的同名文件是**两张不同照片**，不是同一张的主图/派生副本。
+     *   早期分组键只取基名 → 其中一张真实照片被判为副本静默丢弃（相机重置计数后重新拍摄的
+     *   IMG_0001.jpg、或多个源目录下的备份目录同名文件，都是典型场景）。
+     */
+    @Test fun `不同目录同名文件不互相合并`() {
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(2, "b/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(2, out.size, "跨目录同名属两张不同照片，都应保留")
+        assertEquals(0, merged, "不得把其中一张当成副本合并掉")
+    }
+
+    /** 回归保护：分组键加入目录维度后，同目录内的派生去重行为必须保持不变。 */
+    @Test fun `同目录同名派生副本仍然合并`() {
+        val candidates = listOf(
+            c(1, "a/IMG_20260925_080504148.jpg", "IMG_20260925_080504148.jpg"),
+            c(2, "a/IMG_20260925_080504148_compressed.jpeg", "IMG_20260925_080504148_compressed.jpeg"),
+        )
+        val (out, merged) = PhotoIngest.dedupDerived(candidates)
+        assertEquals(1, out.size)
+        assertEquals(1, merged)
+    }
+
     @Test fun `派生后缀大小写不敏感且仅当紧跟扩展名`() {
         val candidates = listOf(
             c(1, "a/IMG_20260925_080504148_Compressed.JPEG", "IMG_20260925_080504148_Compressed.JPEG"),

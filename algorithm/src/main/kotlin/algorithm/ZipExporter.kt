@@ -75,7 +75,15 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
                 val base = p.displayName.ifBlank { p.sourceRef.substringAfterLast('/').substringAfterLast('\\') }
                 var name = base
                 var k = 1
-                while ("$folder/$name" in usedNames) { name = base.substringBeforeLast('.') + "_$k." + base.substringAfterLast('.', ""); k++ }
+                while ("$folder/$name" in usedNames) {
+                    // ★ 2026-10-31 审查修复：base 无扩展名时，旧写法会拼出 "IMG001_1." 这类尾随点名，
+                    //   Windows 解压报「文件名无效」导致该条目丢失；按有无扩展名分别拼接。
+                    //   dot > 0 才视为扩展名（排除 ".nomedia" 这类点开头文件名）。
+                    val dot = base.lastIndexOf('.')
+                    name = if (dot > 0) "${base.substring(0, dot)}_$k${base.substring(dot)}"
+                    else "${base}_$k"
+                    k++
+                }
                 usedNames += "$folder/$name"
                 targets["$folder/$name"] = File(p.sourceRef)
             }
@@ -90,7 +98,12 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
         //      会误判"已完成"整包跳过 → 输出目录不刷新，用户拿到旧 ZIP（含旧台账）甚至无文件产出。
         val completed = readCompleted(stateFile)
         if (extraFiles.isEmpty() && completed != null &&
-            !completed.withLedger && completed.paths == targets.keys
+            !completed.withLedger && completed.paths == targets.keys &&
+            // ★ 2026-10-31 审查修复：仅比对路径集合不足以判定"已完成"。状态文件按巡查日期存放
+            //   （与输出位置解耦），用户换输出目录、或删除上次产物后状态仍在 → 走跳过分支会让
+            //   调用方拿到 copied=0 / failed=0，进而不复制任何文件到新目录（零产出却提示
+            //   "跳过已完成 N"）。补上产物存在性校验：产物不在就重新打包。
+            outFile.isFile && outFile.length() > 0
         ) {
             return Result(0, 0, targets.size)
         }

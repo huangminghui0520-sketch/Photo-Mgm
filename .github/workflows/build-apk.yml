@@ -26,6 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # ★ 2026-10-31 复核：「吞掉协程取消信号」的门禁已移到 ci.yml 的 cancellation-guard job。
+      #   理由：① 那里同时监听 pull_request 与 push，分支上就能看到结果（本 workflow 只在 main/tag 触发）；
+      #        ② 那里会先跑 scripts/check-cancellation.py --selftest，确认判据没退化再扫描源码；
+      #        ③ 本 workflow 只负责出包，不重复跑同一项检查（构建链上失败点越靠前越好，
+      #           但同一项检查跑两遍只会拖长反馈时间）。
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:

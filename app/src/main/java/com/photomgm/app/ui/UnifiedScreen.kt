@@ -157,21 +157,26 @@ fun UnifiedScreen(vm: AppViewModel) {
         }
 
         // ⑤ 底部常驻操作条：导出始终可见
+        // ★ 2026-10-31 审查修复：未匹配计数统一取「有效未匹配」（扣除已人工移入事件的、加入被人工移除的），
+        //   与列表页（LogSection）和 ZIP 导出口径一致。此前用 classify.unmatched 原始值，
+        //   人工把 3 张照片移入事件后底栏仍显示旧数字，用户据此判断"哪些不入台账"必然误判。
+        val effectiveUnmatched = state.classify?.let { vm.effectiveUnmatched(it) } ?: emptyList()
         val gate: ExportGate = when {
             state.sourceDirs.isEmpty() -> ExportGate.NoSourceDir
             state.parsed == null -> ExportGate.NoLogs
             state.classify == null -> ExportGate.NoPhotos
             else -> ExportGate.Ready(
-                unmatched = state.classify?.unmatched?.size ?: 0,
+                unmatched = effectiveUnmatched.size,
             )
         }
         BottomActionBar(
             gate = gate,
             ledgerRows = state.ledger?.size,
             pendingEvents = state.classify?.pendingEventIds?.size ?: 0,
-            unmatchedPhotos = state.classify?.unmatched?.size ?: 0,
+            unmatchedPhotos = effectiveUnmatched.size,
             progress = state.exportProgress,
             doneMessage = state.exportMessage,
+            exportOk = state.exportOk,
             onExport = { vm.exportZip() },
             onOpenExportResult = if (state.lastExport != null) {
                 { vm.openExportedFile() }

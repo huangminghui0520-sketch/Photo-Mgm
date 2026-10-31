@@ -1,0 +1,88 @@
+name: CI
+
+# 与 Build APK（build-apk.yml，只出包）分开的两类检查：
+#   1. cancellation-guard：纯 python3，几秒钟出结果，把"吞掉协程取消信号"拦在编译之前；
+#   2. unit-test：algorithm（纯 JVM）+ app（Robolectric）单元测试。
+# ★ 必须监听 pull_request：否则分支上的检查只有推送到 main 才跑，PR 里永远是空的。
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cancellation-guard:
+    name: Coroutine cancellation guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ★ 三条"可重现性前提"（2026-10-31 复核）：
+      #   ① python3 存在（ubuntu-24.04 预装；脚本只用标准库，不开线程、不读环境变量、不联网）；
+      #   ② 脚本真的进了仓库——.gitignore 里有全局 `*.py`，靠 `!scripts/*.py` 白名单放行，
+      #      白名单一旦失效，CI checkout 里根本没有这个文件，报错会是"can't open file"，
+      #      看不出根因，所以在这里显式断言；
+      #   ③ 脚本不依赖调用方 cwd（内部按仓库根解析相对路径），换 runner / 换 job 都成立。
+      - name: 可重现性前提
+        run: |
+          python3 --version
+          git ls-files --error-unmatch scripts/check-cancellation.py
+
+      # ★ 先跑内置样例自测：确认"判据本身没有退化"。
+      #   门禁是 300 行的自制词法分析器，没有外部依赖可对拍，最危险的回归是"规则还在、
+      #   判据失效"——表现是永远绿。自测覆盖：该报的必须报、不该报的不能报、
+      #   CRLF 与 LF 判定结果完全一致（core.autocrlf 的换行差异不得影响行号/括号深度）。
+      - name: 判据自测
+        run: python3 scripts/check-cancellation.py --selftest
+
+      - name: 扫描 Kotlin 源码
+        run: python3 scripts/check-cancellation.py app algorithm data
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    # ★ TZ 必须固定（2026-10-31 首次跑测试时暴露）：
+    #   runner 默认 UTC，而生产代码在 7 处用 ZoneId.systemDefault() 把 epoch 毫秒解释成
+    #   本地时间（AlgorithmApi.parseLog / EventClassifyEngine×2 / LedgerEngine×2 /
+    #   LogParserEngine / ZipExporter，加上 app 侧 UI）。UTC 下台账日期列整体偏移 8 小时、
+    #   "当日零点"边界错位 → 5 条用例在本地(+08:00)绿、在 CI(UTC)红（已本地复现）。
+    #   固定 Asia/Shanghai 让 CI 与国内真机一致；"要不要把时区改成显式注入"是**产品级**
+    #   决策（牵动全链路语义），已单独立项待确认，不在本轮改动。
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.10.2
+
+      # ★ 用例自己会兜底：依赖真实照片的 VM 用例（AppViewModelTest / ExifMergedReaderTest 等）
+      #   在拿不到源照片时用 assumeTrue 跳过，因此本 job 在无照片的 runner 上是绿的，
+      #   而不是"假装跑过"。慢用例（导出重入，本机 ~7.8s）同属这一类。
+      - name: Run unit tests
+        run: gradle :algorithm:test :app:testDebugUnitTest --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-reports
+          path: |
+            algorithm/build/reports/tests/test
+            app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: warn

@@ -56,7 +56,8 @@ internal sealed interface ExportGate {
  * @param pendingEvents 待复查事件数
  * @param unmatchedPhotos 未匹配照片数
  * @param progress 导出进度 0..1；非空 = 正在导出
- * @param doneMessage 导出完成信息；非空 = 已导出成功
+ * @param doneMessage 导出结果信息；非空 = 本次已结束（成功或失败由 [exportOk] 区分）
+ * @param exportOk 本次导出是否成功；null = 尚未导出过
  * @param onExport 点「导出」时执行（就绪时）
  * @param onFix 点提示区时执行——跳到能解决问题的位置（设置 / 日志）
  */
@@ -68,6 +69,7 @@ internal fun BottomActionBar(
     unmatchedPhotos: Int,
     progress: Float?,
     doneMessage: String?,
+    exportOk: Boolean?,
     onExport: () -> Unit,
     onFix: () -> Unit,
     onOpenExportResult: (() -> Unit)? = null,
@@ -92,7 +94,11 @@ internal fun BottomActionBar(
                 )
             }
 
+            // ★ 2026-10-31 审查修复：doneMessage 在成功与失败时都非 null，必须按 exportOk 区分——
+            //   否则导出失败（输出目录不可写、打包异常）也显示绿色「导出完成 ✓」，
+            //   用户会据此认为产物已生成并直接外发台账。
             val (statusText, statusColor) = when {
+                exportOk == false -> "导出未完成 ⚠" to MaterialTheme.colorScheme.error
                 doneMessage != null -> "导出完成 ✓" to MaterialTheme.colorScheme.primary
                 ready -> buildString {
                     append(ledgerRows?.let { "台账 $it 行" } ?: "台账待生成")
@@ -106,7 +112,7 @@ internal fun BottomActionBar(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (!ready && doneMessage == null) {
+                if (!ready && exportOk != true) {
                     Icon(
                         Icons.Filled.Warning, null,
                         Modifier.size(14.dp),
@@ -126,6 +132,8 @@ internal fun BottomActionBar(
                 if (ready) {
                     Button(
                         onClick = onExport,
+                        // ★ 2026-10-31：导出进行中禁用入口（VM 侧已有同步门禁，此处为可见的界面反馈）
+                        enabled = progress == null,
                         modifier = Modifier.heightIn(min = 44.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.tertiary,
