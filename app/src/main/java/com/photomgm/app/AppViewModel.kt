@@ -134,6 +134,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val exportBusy = AtomicBoolean(false)
 
     /**
+     * ★ 2026-10-31 复核：导出 / 解析互斥的**另一半**（补全此前只有半边的门禁）。
+     *
+     *   已有的一半：exportZip 开头检查 `state.value.busy` —— 解析流水线跑着就不许导出。
+     *   缺失的一半："导出跑着就不许重启解析"。不补全的后果：导出过程中改日期/改源目录/点解析，
+     *   流水线会把 photos / classify / ledger 清空重算，而导出协程手里握的是**入口时抓的快照 s**，
+     *   仍按 s.photos 逐张读盘打包——于是 ZIP 与界面、与台账三方不再对应；更糟的是断点续传
+     *   状态文件按日期命名，新旧两批照片会在同一份续传状态里交叉，下次导出跳过本该打包的照片。
+     *
+     *   ★ 判据用 [exportBusy] 而不是 state.value.exportProgress：后者是**UI 状态**，
+     *     提前返回分支会把它置 null，语义是"进度显示"，不是"是否正在导出"。
+     *   ★ 只做同步判断 + 提示，不引入锁：解析与导出各跑各的协程，这里只是拒绝"启动"这一刻，
+     *     成本是一次 volatile 读。
+     *
+     * @return true = 被导出挡住，调用方应直接 return（不启动流水线）
+     */
+    private fun blockedByExport(): Boolean {
+        if (!exportBusy.get()) return false
+        _state.update { it.copy(message = "导出进行中，请等待导出完成后再操作") }
+        return true
+    }
+
+    /**
      * ★ P2-2：dupGroupsOf 结果缓存——照片 List 引用未变（集合未变）则复用，
      *   避免三态切换/预览/导出每次全量 O(n²) 重算。groupDupContent 为纯函数（幂等），
      *   重复计算一次的结果一致。
@@ -246,6 +268,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * 变更即触发；取消旧任务防止快速连续操作导致旧结果覆盖新结果。
      */
     private fun autoPipeline() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重启扫描流水线）
+        if (blockedByExport()) return
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -432,6 +456,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *   旧 classify 引用已删照片 URI → 事件网格显示灰色方块缩略图。
      */
     fun parseLogs() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重启解析流水线）
+        if (blockedByExport()) return
         val s = state.value
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch(Dispatchers.IO) {
@@ -543,21 +569,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- 分类 + 台账（§5/§6/§7） ----------
-    fun runClassify() = viewModelScope.launch(Dispatchers.Default) {
-        if (state.value.busy) return@launch
-        val s = state.value
-        val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
-        if (s.photos.isEmpty()) { _state.update { it.copy(message = "无照片（请先粗筛并精读）") }; return@launch }
-        // ★ 2026-10-07 修复：手动「生成分类」= 全新分配，上一批人工移动（overrideMap）作废
-        store.overrideMap = emptyMap()
-        _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
-        val g = AlgorithmApi.gpsGroup(s.photos)
-        val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
-        _state.update { it.copy(classify = c, busy = false, progressStage = null) }
-        // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
-        saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
-        // ★ P3-8：手动分类完成 → 同步刷新台账行
-        buildLedger()
+    fun runClassify() {
+        // ★ 2026-10-31 复核：与导出互斥的半边（导出期间不重算分类，否则导出手里的快照与状态错位）
+        if (blockedByExport()) return
+        viewModelScope.launch(Dispatchers.Default) {
+            if (state.value.busy) return@launch
+            val s = state.value
+            val parsed = s.parsed ?: run { _state.update { it.copy(message = "请先解析日志") }; return@launch }
+            if (s.photos.isEmpty()) { _state.update { it.copy(message = "无照片（请先粗筛并精读）") }; return@launch }
+            // ★ 2026-10-07 修复：手动「生成分类」= 全新分配，上一批人工移动（overrideMap）作废
+            store.overrideMap = emptyMap()
+            _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
+            val g = AlgorithmApi.gpsGroup(s.photos)
+            val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
+            _state.update { it.copy(classify = c, busy = false, progressStage = null) }
+            // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
+            saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
+            // ★ P3-8：手动分类完成 → 同步刷新台账行
+            buildLedger()
+        }
     }
 
     /**
@@ -585,7 +615,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun dupGroupsOf(s: UiState): Map<Long, List<Photo>> {
         val photos = s.photos
-        dupGroupsCache.get()?.let { if (it.ref === photos) return it.result }
+        // ★ 读侧（2026-10-31 复核点）：**只 get() 一次**，拿到的是一个不可变快照对象，
+        //   再从这同一个对象上取 ref 与 result —— 两者必然同生共死。
+        //   ⚠ 严禁写成下面这种两次 get() 的形式：
+        //       if (dupGroupsCache.get()?.ref === photos) return dupGroupsCache.get()!!.result
+        //     两次 get() 之间缓存可能已被别的线程整体替换，于是"新 photos 配旧 result"，
+        //     写侧的一次性原子发布就被读侧抵消了（症状与修复前完全一样，且更难复现）。
+        val snapshot = dupGroupsCache.get()
+        if (snapshot != null && snapshot.ref === photos) return snapshot.result
         val g = PhotoIngest.groupDupContent(photos, dedupConfig())
         // ★ 一次引用赋值发布（ref 与 result 同生共死），杜绝"ref 已更新、result 仍陈旧"的中间态
         dupGroupsCache.set(DupGroupsCache(photos, g))

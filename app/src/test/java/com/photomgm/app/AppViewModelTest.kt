@@ -231,6 +231,14 @@ class AppViewModelTest {
      *   判据：被放行的第二次调用会执行 `_state.update { exportProgress = 0f }`，
      *   把已在推进的进度打回 0——这是唯一可观测、且只有重入才会产生的状态变化。
      */
+    // ★ 慢用例（本机 ~7.8s：整批照片走完整导出，含台账 Excel 的图片编码）。
+    //   两条 CI 约定（2026-10-31 复核）：
+    //   ① 落盘一律走临时目录（本用例的输出目录用 Files.createTempDirectory，
+    //      ZIP/状态文件由 AppViewModel 写进 app 私有 cacheDir/filesDir，Robolectric 下也是临时的）
+    //      —— 不用常量路径：既不污染工作区，也避免同机并发（Gradle 并行 fork / CI 多 job）
+    //      互相覆盖同一个输出目录，那会让"导出失败"变成随机失败。
+    //   ② 用例自己兜底：CI runner 上没有 9-25 源照片时，上方 registerMediaStore 里的
+    //      assumeTrue 会跳过它，因此不会逼近 CI 的 job 超时；本机有照片时仍然全量跑。
     @Test
     fun `导出进行中再次点击_进度不被复位_不会并发执行`() {
         registerMediaStore()

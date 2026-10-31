@@ -138,6 +138,20 @@ object ImageUtils {
     fun process(context: Context, ref: String): ByteArray? {
         val bmp = decodeForThumbnail(context, ref)
         if (bmp == null) { Log.w("PM_Image", "process: bmp null, ref=$ref"); return null }
+        return processBitmap(bmp)
+    }
+
+    /**
+     * ★ 裁剪 → 缩放 → 压缩，并**接管入参 Bitmap 的所有权**（在所有出口回收）。
+     *
+     * 抽出为独立函数的唯一理由：让 [process] 的所有权契约可以被单测直接验证
+     * （Robolectric 下注入一个可控 Bitmap，断言它在"裁剪失败"等分支也被 recycle）。
+     * 判据若只能靠"读代码确认 finally 写了"，就会在下一次改结构时被悄悄破坏。
+     *
+     * ⚠ 调用方契约：传入后**不得再使用**该 Bitmap（本函数结束时它已被回收）；
+     *   返回值是独立的 [ByteArray]，与 Bitmap 无任何引用关系。
+     */
+    internal fun processBitmap(bmp: Bitmap): ByteArray? {
         // ★ 2026-10-31 审查修复：下面任一步提前返回都会漏掉 bmp.recycle()（原实现只在正常路径回收）。
         //   导出是逐张循环调用本函数，累积未回收的原图 Bitmap 可达数百 MB → OOM。
         //   用 try/finally 保证任何出口（含裁剪失败、createBitmap 返回 null）都回收。
