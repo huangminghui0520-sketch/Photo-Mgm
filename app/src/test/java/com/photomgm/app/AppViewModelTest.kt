@@ -10,6 +10,13 @@ import android.app.Application
 import android.os.Looper
 import android.provider.MediaStore
 import androidx.test.core.app.ApplicationProvider
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -23,6 +30,8 @@ import org.robolectric.fakes.BaseCursor
 import java.io.File
 import java.nio.file.Files
 import java.time.LocalDate
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -190,5 +199,100 @@ class AppViewModelTest {
         assertTrue("新日志应解析出更多事件", s.parsed != null && s.parsed!!.events.size >= 4)
         assertNotNull("再次解析后应重新分类", s.classify)
         assertTrue("再次解析后应保持非 busy", !s.busy)
+    }
+
+    // ---------- ★ 2026-10-31 审查补强：导出门禁（S3）与缓存发布（S8）的确定性用例 ----------
+
+    /**
+     * ★ S3 回归（门禁释放）：门禁是 AtomicBoolean + 协程 finally 释放。
+     *   两个必须同时成立：① 提前返回也要复位 exportProgress（否则导出入口永远显示"正在导出"）；
+     *   ② 提前返回也要释放门禁（否则第二次点击被静默吞掉，用户以为"导出没反应"）。
+     *   不需要真实照片即可判定，是全类里最稳的一条并发回归。
+     */
+    @Test
+    fun `导出提前返回后门禁与进度都被复位_可再次导出`() {
+        val vm = AppViewModel(app)
+        vm.setOutputDir(null)                 // 未设置输出目录 → 走提前返回分支
+        vm.exportZip()
+        await(vm) { it.message != null }
+        assertNotNull("未设置输出目录时应给出提示", vm.state.value.message)
+        assertTrue("提前返回必须复位 exportProgress，否则导出入口永久显示'正在导出'",
+            vm.state.value.exportProgress == null)
+
+        // ★ 关键：门禁必须已释放
+        vm.clearMessage()
+        vm.exportZip()
+        await(vm) { it.message != null }
+        assertNotNull("门禁未释放 → 第二次导出被静默吞掉（用户点不动）", vm.state.value.message)
+    }
+
+    /**
+     * ★ S3 回归（重入拦截）：导出进行中再次点击，必须被门禁直接丢弃。
+     *   判据：被放行的第二次调用会执行 `_state.update { exportProgress = 0f }`，
+     *   把已在推进的进度打回 0——这是唯一可观测、且只有重入才会产生的状态变化。
+     */
+    @Test
+    fun `导出进行中再次点击_进度不被复位_不会并发执行`() {
+        registerMediaStore()
+        val vm = AppViewModel(app)
+        vm.setDate(LocalDate.of(2026, 9, 25))
+        vm.addSourceDir("DCIM/Camera")
+        await(vm) { it.coarseCount != null && !it.busy }
+        val logFile = findLogFile()
+        assumeTrue("9-25 日志文件缺失，跳过", logFile != null)
+        vm.setLogsText(logFile!!.readLines().take(12).joinToString("\n"))
+        vm.parseLogs()
+        await(vm) { it.classify != null && !it.busy }
+        vm.setOutputDir(Files.createTempDirectory("PhotoMgmExport").toFile().absolutePath)
+
+        vm.exportZip()
+        await(vm) { (it.exportProgress ?: 0f) > 0f }      // 等首次导出真正开始推进
+        assumeTrue("首次导出已结束，本用例失去区分度，跳过",
+            (vm.state.value.exportProgress ?: 0f) > 0f)
+
+        val reset = AtomicBoolean(false)
+        val scope = CoroutineScope(Dispatchers.Default)
+        val job = vm.state.onEach { if (it.exportProgress == 0f) reset.set(true) }.launchIn(scope)
+        try {
+            vm.exportZip()                                 // 第二次点击（应被门禁丢弃）
+            Thread.sleep(300)
+        } finally {
+            job.cancel()
+            scope.cancel()
+        }
+        assertFalse("第二次点击被放行 → 两个导出协程会共用同一 tmpZip 互相删文件（ZIP 损坏）", reset.get())
+
+        await(vm) { it.exportMessage != null && it.exportProgress == null }
+        assertTrue("导出结束后进度必须归零", vm.state.value.exportProgress == null)
+    }
+
+    /**
+     * ★ S8 回归（快照一致性）：dupGroupsOf 的结果缓存由**单个** AtomicReference 整体发布。
+     *   旧实现是 ref / result 两个独立字段，写-读交错的窗口内会返回"上一批照片"的分组结果。
+     *   本用例让 8 个线程高频读取，断言任何一次读到的都是同一份一致快照。
+     */
+    @Test
+    fun `并发读取三态展开_结果始终一致`() {
+        registerMediaStore()
+        val vm = AppViewModel(app)
+        vm.setDate(LocalDate.of(2026, 9, 25))
+        vm.addSourceDir("DCIM/Camera")
+        await(vm) { it.coarseCount != null && !it.busy }
+        val logFile = findLogFile()
+        assumeTrue("9-25 日志文件缺失，跳过", logFile != null)
+        vm.setLogsText(logFile!!.readLines().take(12).joinToString("\n"))
+        vm.parseLogs()
+        await(vm) { it.classify != null && !it.busy }
+
+        val c = vm.state.value.classify!!
+        val baseline = vm.previewEventMap(c)          // 单线程基准
+        val mismatch = AtomicInteger(0)
+        val threads = (1..8).map {
+            Thread {
+                repeat(100) { if (vm.previewEventMap(c) != baseline) mismatch.incrementAndGet() }
+            }.apply { start() }
+        }
+        threads.forEach { it.join() }
+        assertEquals("并发读取拿到了不一致的去重分组快照（缓存发布非原子）", 0, mismatch.get())
     }
 }
