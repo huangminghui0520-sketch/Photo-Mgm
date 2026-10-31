@@ -415,4 +415,88 @@ class XlsxWriterTest {
         val drawing = entries(bytes).first { it.first == "xl/drawings/drawing1.xml" }.second
         assertTrue(drawing.contains("""<xdr:from><xdr:col>6</xdr:col>"""), "被嵌入的是第 2 张（G 列）")
     }
+
+    // ---- ★ 2026-10-31 W2（issue #5）：嵌入图片总字节预算，超限降级而不崩 ----
+    //
+    // 背景：本实现先把全部图片字节收进内存再一次性写 ZIP，峰值 ≈ 照片数 × 单张字节数；
+    // OOM 是 Error 不是 Exception，外层 catch(Exception) 抓不到，进程直接死。
+    // 兜底 = 总字节上限；超限后跳过嵌入，但必须在台账里注明，不许静默丢数据。
+
+    /** 一段"像 JPEG"的字节：只要求文件头合法（imageFormat 只嗅前 3 字节）。 */
+    private fun jpegOf(size: Int): ByteArray =
+        ByteArray(size).also {
+            it[0] = 0xFF.toByte(); it[1] = 0xD8.toByte(); it[2] = 0xFF.toByte()
+        }
+
+    /**
+     * 超限时的**降级语义**：前面的照片照常嵌入，超预算那张及其后一律不嵌入，
+     * 且受影响的照片列要写明原因（信息不丢、文件仍能打开）。
+     */
+    @Test fun `图片总字节超限时跳过后续嵌入并在台账里注明`() {
+        val jpeg = jpegOf(800)                       // 每张 800B
+        val rows = listOf(
+            row(p1 = "a.jpg", p2 = "b.jpg"),         // 第 2 行：a 进（800），b 超（1600>1000）
+            row(p1 = "c.jpg", p2 = "d.jpg"),         // 第 3 行：都超
+        )
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.writeWithBudget(rows, it, maxImageBytes = 1000) { jpeg }
+        }.toByteArray()
+        val es = entries(bytes)
+        val names = es.map { it.first }
+
+        // 1) 只嵌入了预算内的那一张，且 media 编号连续
+        assertEquals(1, names.count { it.startsWith("xl/media/") }, "只应嵌入预算内的 1 张")
+        assertTrue("xl/media/image1.jpg" in names)
+        assertTrue("xl/media/image2.jpg" !in names, "超预算的图不得写入 media")
+        // 2) drawing 与 rels 一致（1 张 → 1 个锚点、1 条 rel）
+        val drawing = es.first { it.first == "xl/drawings/drawing1.xml" }.second
+        assertEquals(1, Regex("<xdr:oneCellAnchor>").findAll(drawing).count())
+        val rels = es.first { it.first.endsWith("drawing1.xml.rels") }.second
+        assertEquals(1, Regex("<Relationship ").findAll(rels).count())
+
+        // 3) 台账里必须注明：3 个被跳过的照片单元格写文件名 + 未嵌入说明
+        val sheet = es.first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertEquals(
+            3,
+            Regex(Regex.escape(XlsxWriter.IMAGE_SKIPPED_NOTE)).findAll(sheet).count(),
+            "b/c/d 三个单元格都要注明未嵌入",
+        )
+        assertTrue(sheet.contains(">b.jpg${XlsxWriter.IMAGE_SKIPPED_NOTE}<"), "被跳过的单元格仍要写文件名")
+        // 4) 未被跳过的 a.jpg 不得带说明
+        assertTrue(sheet.contains(">a.jpg<"), "预算内的照片列只写文件名，不应带未嵌入说明")
+        // 5) 仍然是一份结构完整的 xlsx
+        assertTrue("xl/worksheets/sheet1.xml" in names)
+    }
+
+    /**
+     * 预算用尽后**不得再调用 imageLoader**。
+     *
+     * 这是兜底能否成立的关键：App 侧的 imageLoader 会解码 + 压 JPEG，继续调用等于继续分配内存，
+     * 只判"不写进 media"根本挡不住 OOM。用例直接数调用次数。
+     */
+    @Test fun `预算用尽后不再向 imageLoader 取图`() {
+        var calls = 0
+        val jpeg = jpegOf(800)
+        val rows = listOf(
+            row(p1 = "a.jpg", p2 = "b.jpg"),
+            row(p1 = "c.jpg", p2 = "d.jpg"),
+        )
+        ByteArrayOutputStream().also {
+            XlsxWriter.writeWithBudget(rows, it, maxImageBytes = 1000) { calls++; jpeg }
+        }
+        // a 取一次（进），b 取一次（判定超预算 → 用尽）；c/d 一次都不能取
+        assertEquals(2, calls, "预算用尽后仍在向 imageLoader 取图，兜底失效")
+    }
+
+    /** 回归：预算充足时不得出现"未嵌入"说明（正常路径不能被兜底逻辑污染）。 */
+    @Test fun `预算充足时不出现未嵌入说明`() {
+        val jpeg = jpegOf(800)
+        val bytes = ByteArrayOutputStream().also {
+            XlsxWriter.writeWithBudget(listOf(row(p1 = "a.jpg", p2 = "b.jpg")), it, maxImageBytes = 1_000_000) { jpeg }
+        }.toByteArray()
+        val es = entries(bytes)
+        assertEquals(2, es.count { it.first.startsWith("xl/media/") }, "预算充足时两张都应嵌入")
+        val sheet = es.first { it.first == "xl/worksheets/sheet1.xml" }.second
+        assertTrue(!sheet.contains(XlsxWriter.IMAGE_SKIPPED_NOTE), "预算充足时不得出现未嵌入说明")
+    }
 }
