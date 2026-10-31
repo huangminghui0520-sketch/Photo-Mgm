@@ -20,6 +20,13 @@ import java.time.LocalDate
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("photo_mgm_settings", Context.MODE_PRIVATE)
 
+    /**
+     * 日志文本专用 prefs（W3 / issue #4）。
+     * 独立文件的意义：`apply()` 全量重写的是**本文件**的 XML，本文件只有日志这一个 key，
+     * 所以写日志的代价与主 prefs 里 MB 级的照片缓存彻底解耦。
+     */
+    private val logsPrefs = context.getSharedPreferences("photo_mgm_logs", Context.MODE_PRIVATE)
+
     var date: LocalDate
         get() = prefs.getString(KEY_DATE, null)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
             ?: LocalDate.now(AppZone.ID)
@@ -44,9 +51,27 @@ class SettingsStore(context: Context) {
         } ?: DedupKeepMode.KEEP_WATERMARKED
         set(v) = prefs.edit().putString(KEY_DEDUP_MODE, v.name).apply()
 
+    /**
+     * 日志文本（W3 / issue #4）。
+     *
+     * ★ 单独存一个 prefs 文件（[logsPrefs]），不与主 prefs 混放：主 prefs 的 XML 里含
+     *   MB 级的 `cache_photos`，而 SharedPreferences 的 `apply()` 是**全量重写整个 XML**。
+     *   以前日志文本存在主 prefs 里，输入框每敲一个字符就触发一次 MB 级写盘 —— 卡顿 + 闪存磨损。
+     *   隔离到独立文件后，写日志只重写「只有这一个 key」的小文件；再叠加
+     *   [LogsTextStore] 的防抖，连打时只落一次盘。
+     *
+     * 读侧兼容旧数据：新版 key 缺失时回落到主 prefs 的旧 [KEY_LOGS]，读到就**迁移**到新文件
+     * 并把旧 key 从主 prefs 删除（一次性瘦身，之后主 XML 不再被日志文本撑大）。
+     */
     var logsText: String
-        get() = prefs.getString(KEY_LOGS, "") ?: ""
-        set(v) = prefs.edit().putString(KEY_LOGS, v).apply()
+        get() {
+            logsPrefs.getString(KEY_LOGS_TEXT, null)?.let { return it }
+            val legacy = prefs.getString(KEY_LOGS, null) ?: return ""
+            logsPrefs.edit().putString(KEY_LOGS_TEXT, legacy).apply()
+            prefs.edit().remove(KEY_LOGS).apply()
+            return legacy
+        }
+        set(v) = logsPrefs.edit().putString(KEY_LOGS_TEXT, v).apply()
 
     /** 人工标记 photoId → 目标事件（§8.3 人工移动） */
     var overrideMap: Map<Long, Int>
@@ -311,7 +336,10 @@ class SettingsStore(context: Context) {
         const val KEY_OUTPUT = "output_dir"
         const val KEY_TEMPLATE = "naming_template"
         const val KEY_DEDUP_MODE = "dedup_keep_mode"
+        /** 旧位置（主 prefs，MB 级 XML）：仅用于读侧兼容迁移，见 [logsText]。 */
         const val KEY_LOGS = "logs_text"
+        /** 新位置（[logsPrefs] 独立文件内的 key）。 */
+        const val KEY_LOGS_TEXT = "logs_text"
         const val KEY_OVERRIDE = "photo_override"
         const val KEY_MARKED = "photo_marked"
         const val KEY_PARSED_CACHE = "cache_parsed"

@@ -107,6 +107,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val repo = PhotoRepository(app)
 
     /**
+     * 日志文本落盘器（W3 / issue #4）：输入时只更新内存态，落盘防抖 400ms。
+     * 见 [LogsTextStore] 头部说明——以前每敲一个字符就 MB 级全量重写 SharedPreferences。
+     */
+    internal var logsTextStore: LogsTextStore = LogsTextStore(
+        persist = { store.logsText = it },
+        scope = viewModelScope,
+    )
+
+    /**
      * 缩略图缓存。默认接 Coil 全局单例（见 [CoilThumbnailCache]）。
      *
      * ★ `internal` setter 仅供单元测试注入假实现以验证"先清后缓存"的顺序——
@@ -436,13 +445,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- 日志（§3：粘贴 → 解析，如实显示不脱敏） ----------
-    fun setLogsText(text: String) { store.logsText = text; _state.update { it.copy(logsText = text) } }
+    /**
+     * 日志文本变化（W3 / issue #4）。
+     *
+     * ★ 只更新内存态，落盘交给 [logsTextStore] 防抖：输入框的即时反馈不受写盘影响，
+     *   连打时只在停手后写一次。解析用的是 `state.logsText`（内存态），因此"刚打完就点解析"
+     *   拿到的一定是最新文本，不依赖落盘是否已完成。
+     */
+    fun setLogsText(text: String) {
+        _state.update { it.copy(logsText = text) }
+        logsTextStore.onChanged(text)
+    }
 
     /** ★ 删除日志：清文本 + 清解析/匹配结果（P3-4：粗筛已无 TTL 缓存，无需再清），避免旧匹配残留。 */
     fun clearLogs() {
+        // ★ W3：必须先取消待落盘，否则防抖窗口到期会把刚删掉的旧文本写回去（表现为"删了又回来"）
+        logsTextStore.cancelPending()
         store.logsText = ""
         store.clearStateCache()
         _state.update { it.copy(logsText = "", parsed = null, classify = null, ledger = null, exportMessage = null) }
+    }
+
+    /**
+     * W3：ViewModel 销毁前把待落盘的日志文本刷下去 —— 防抖窗口还没到期就退出 App，
+     * 也不能丢最后一次输入。
+     */
+    override fun onCleared() {
+        logsTextStore.flush()
+        super.onCleared()
     }
 
     /**
