@@ -69,6 +69,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -79,6 +80,7 @@ import coil.compose.AsyncImage
 import algorithm.model.LogEvent
 import algorithm.model.Photo
 import com.photomgm.app.AppViewModel
+import com.photomgm.app.ThumbnailSpec
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
@@ -499,6 +501,10 @@ internal fun Thumb(
     onLongClick: () -> Unit = {},
 ) {
     val primary = MaterialTheme.colorScheme.primary
+    // ★ W5(#3)：tile 与预加载共用 ThumbnailSpec（同尺寸 + 同缓存键），否则界面命中不到预加载结果
+    //   LocalContext.current 是 @Composable 读，remember 的 calculation 禁 composable 调用，故先取出来
+    val ctx = LocalContext.current
+    val thumbReq = remember(ctx, model) { ThumbnailSpec.request(ctx, model) }
     Box(
         Modifier
             .padding(4.dp)
@@ -517,7 +523,7 @@ internal fun Thumb(
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
         AsyncImage(
-            model = model,
+            model = thumbReq,
             contentDescription = name,
             modifier = Modifier.fillMaxSize(),
             contentScale = androidx.compose.ui.layout.ContentScale.Crop,
@@ -945,8 +951,11 @@ private fun PhotoTile(
             .background(MaterialTheme.colorScheme.surfaceContainerHighest)
             .combinedClickable(onClick = onTap, onLongClick = onLongPress),
     ) {
+        // ★ W5(#3)：照片网格同样走 ThumbnailSpec，与预加载共用尺寸与内存缓存键
+        val ctx = LocalContext.current
+        val thumbReq = remember(ctx, p.sourceRef) { ThumbnailSpec.request(ctx, p.sourceRef) }
         AsyncImage(
-            model = p.sourceRef,
+            model = thumbReq,
             contentDescription = p.displayName,
             modifier = Modifier.fillMaxSize(),
             contentScale = androidx.compose.ui.layout.ContentScale.Crop,

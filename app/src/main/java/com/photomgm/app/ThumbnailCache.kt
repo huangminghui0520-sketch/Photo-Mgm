@@ -18,6 +18,60 @@ import coil.ImageLoader
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 
+/**
+ * 缩略图请求的**唯一定义**（W5 / issue #3）。
+ *
+ * 为什么需要它：内存缓存键必须覆盖「解码尺寸」这一维度，否则预加载与界面会用同一份
+ * 位图互相覆盖。而"界面"和"预加载"发生在两个地方（Composable / ViewModel），
+ * 只要两边各自拼 key，迟早会漂移。所以尺寸常量、键的拼法、请求的构造都收在这里，
+ * 两边只允许调这里。
+ */
+object ThumbnailSpec {
+    /**
+     * 缩略图边长（dp）。
+     *
+     * ★ 界面 tile 与预加载**必须共用同一个值**：缓存键里带像素尺寸，尺寸不同就是两个
+     *   不同的缓存项 —— 那样预加载写进去的永远命中不到，等于白做。
+     *   取 120dp：覆盖事件网格/照片网格/查看器胶片条的实际显示尺寸（44~80dp）并留出
+     *   高密度屏的余量；再大就是纯浪费（多解出来的像素没人看）。
+     */
+    const val TILE_DP = 120
+
+    /** 上面的 dp 换算成当前屏幕的像素边长。 */
+    fun sizePx(context: Context): Int {
+        val density = context.resources.displayMetrics.density
+        return (TILE_DP * density).toInt().coerceAtLeast(1)
+    }
+
+    /**
+     * 内存缓存键：**把尺寸拼进去**。
+     *
+     * ★ 为什么选"拼进 key"而不是"去掉裸 ref 键、让 Coil 自动算"：
+     *   Coil 自动算键的逻辑在 `RequestService.memoryCacheKey`（internal），测试侧读不到
+     *   「这条请求的键是什么」，于是「同 ref 不同尺寸不得命中同一缓存项」这条性质只能靠
+     *   真跑一次解码来间接验证 —— 慢、脆、还要起 ImageLoader。显式键把这条性质变成
+     *   **可直接断言的对象**，也不随 Coil 版本漂移。
+     *
+     * 磁盘键仍用裸 ref（见 [CoilThumbnailCache.buildRequest]）：磁盘里存的是原始编码数据，
+     * 与解码尺寸无关，按 ref 共享才是对的。
+     */
+    fun memoryCacheKey(ref: String, sizePx: Int): String = "thumb:${sizePx}:$ref"
+
+    /**
+     * 界面侧请求：与预加载的请求**逐字段一致**（同 data、同 size、同内存缓存键），
+     * 这样界面才真的能命中预加载结果。
+     */
+    fun request(context: Context, ref: String, sizePx: Int = sizePx(context)): ImageRequest =
+        ImageRequest.Builder(context.applicationContext)
+            .data(ref)
+            .size(sizePx)
+            .memoryCacheKey(memoryCacheKey(ref, sizePx))
+            .diskCacheKey(ref)
+            .memoryCachePolicy(CachePolicy.ENABLED)
+            .diskCachePolicy(CachePolicy.ENABLED)
+            .build()
+}
+
 interface ThumbnailCache {
     /** 清空全部已缓存缩略图（内存 + 磁盘）。 */
     fun clear()
@@ -57,25 +111,16 @@ class CoilThumbnailCache(context: Context) : ThumbnailCache {
      *
      * ★ 2026-10-31 复核：抽成 internal 方法的唯一理由是让"请求参数"变成**可断言的**——
      *   原先请求在 preload 内部匿名构造，size / 缓存键全是黑盒，W5 的"未限定解码尺寸"
-     *   只能靠人肉读代码发现（据此才有 ThumbnailCacheWiringTest 里的那条尺寸用例）。
+     *   只能靠人肉读代码发现（据此才有 ThumbnailCacheWiringTest 里的那两条用例）。
      *   ⚠ preload 必须且只能走这里入队，否则测试断言的对象与真实入队的请求会分叉。
+     *
+     * @param sizePx 解码边长（像素）。默认取 [ThumbnailSpec.sizePx]，与界面 tile 同值 ——
+     *               这是"预加载能被界面命中"的前提。
      */
-    internal fun buildRequest(ref: String): ImageRequest = ImageRequest.Builder(appContext)
-        .data(ref)
-        // 显式指定与 AsyncImage 相同的缓存键，确保界面端能命中
-        // ★ 已知坑（W5，下一轮修；2026-10-31 实测更正）：
-        //   实测 Coil 2.5 在未指定 size 时用的是默认的 **DisplaySizeResolver**（整屏尺寸，
-        //   Robolectric 下实测解析出 Size(470×470)），并非早前以为的"原图尺寸"。
-        //   问题不在"太大"本身，而在组合：显式 memoryCacheKey(ref) 把**尺寸维度挤出缓存键**，
-        //   于是整屏尺寸的预加载与卡片尺寸的界面请求共用同一个键、互相覆盖。
-        //   → 修复必须**同时**做两件事：加 `.size(w, h)`，并让缓存键带上尺寸
-        //     （要么去掉裸 ref 键改回 Coil 自动计算，要么把尺寸拼进 key）。只做一半都会被
-        //     ThumbnailCacheWiringTest 里那条 @Ignore 的用例挡下。
-        .memoryCacheKey(ref)
-        .diskCacheKey(ref)
-        .memoryCachePolicy(CachePolicy.ENABLED)
-        .diskCachePolicy(CachePolicy.ENABLED)
-        .build()
+    internal fun buildRequest(
+        ref: String,
+        sizePx: Int = ThumbnailSpec.sizePx(appContext),
+    ): ImageRequest = ThumbnailSpec.request(appContext, ref, sizePx)
 
     override fun preload(refs: List<String>, maxCount: Int) {
         if (refs.isEmpty() || refs.size > maxCount) return
