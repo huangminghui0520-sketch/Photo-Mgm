@@ -99,15 +99,61 @@ object XlsxWriter {
     /** 日期时间样式在 styles.xml cellXfs 中的索引（P2-2，numFmtId=164 "yyyy-mm-dd hh:mm"）。 */
     private const val DATE_FMT_STYLE = 2
 
-    /** 把台账行写入 xlsx 字节流（ZIP 容器 + OOXML 部件）。imageLoader 返回照片字节（可为 null）。 */
-    fun write(rows: List<LedgerRow>, out: OutputStream, imageLoader: (String?) -> ByteArray? = { null }) {
-        val imgs = collectImages(rows, imageLoader)
+    /**
+     * 嵌入图片的**总字节预算**（W2 / issue #5）。
+     *
+     * 为什么需要：本实现是"先把全部图片字节收集进内存，再一次性写 ZIP"，峰值内存 ≈
+     * 照片数 × 单张字节数。真机上一份几百张的台账能轻松吃掉数百 MB —— 而 OOM 是 `Error`
+     * 不是 `Exception`，外层的 `catch (Exception)` 抓不到，直接崩，且崩在导出过程中
+     * （前面写好的 ZIP 也废了）。
+     *
+     * 取值 64MB：远低于低端机给单进程的堆上限，又足以容纳常见规模（一张 4:3 缩略图约
+     * 100~300KB，64MB ≈ 200~600 张）。超限不是错误，而是**降级**：后续照片不再嵌入，
+     * 台账照片列仍写文件名并注明未嵌入，信息不丢、文件仍能打开。
+     *
+     * ⚠ 真正的解法是流式写入（边解码边落盘，峰值只跟单张图有关），属重构，另排期。
+     */
+    const val MAX_IMAGE_BYTES: Long = 64L * 1024 * 1024
+
+    /** 照片因预算不足未嵌入时，追加在台账照片列文本后的说明（保证"跳过"可见，不是静默丢数据）。 */
+    internal const val IMAGE_SKIPPED_NOTE = "（未嵌入：照片总量超出内存上限）"
+
+    /**
+     * 把台账行写入 xlsx 字节流（ZIP 容器 + OOXML 部件）。imageLoader 返回照片字节（可为 null）。
+     *
+     * 生产入口：嵌入图片用默认预算 [MAX_IMAGE_BYTES]。
+     * ★ 为什么单独留 [writeWithBudget] 而不是给这里加一个 `maxImageBytes` 参数：
+     *   Kotlin 的尾随 lambda 绑定**最后一个**形参，参数加在 lambda 之后会让
+     *   `XlsxWriter.write(rows, out) { ref -> bytes }` 这种写法把 lambda 绑到 Long 上，
+     *   现有全部调用点（含 App 侧）都得改。故预算只走 internal 重载，公开签名保持不动。
+     */
+    fun write(
+        rows: List<LedgerRow>,
+        out: OutputStream,
+        imageLoader: (String?) -> ByteArray? = { null },
+    ): Unit = writeWithBudget(rows, out, MAX_IMAGE_BYTES, imageLoader)
+
+    /**
+     * 同 [write]，但显式给出嵌入图片的总字节预算。
+     *
+     * @param maxImageBytes 总字节预算。超限后**不再向 imageLoader 取图**（继续取等于继续把
+     *   字节读进内存，兜底就失效了），受影响的行在照片列追加 [IMAGE_SKIPPED_NOTE] 说明。
+     *   internal：只为让测试用小预算复现降级路径，生产侧没有调它的理由。
+     */
+    internal fun writeWithBudget(
+        rows: List<LedgerRow>,
+        out: OutputStream,
+        maxImageBytes: Long,
+        imageLoader: (String?) -> ByteArray?,
+    ) {
+        val collected = collectImages(rows, imageLoader, maxImageBytes)
+        val imgs = collected.images
         ZipOutputStream(out).use { z ->
             z.putNextEntry(ZipEntry("[Content_Types].xml")); z.write(contentTypes(imgs).toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("_rels/.rels")); z.write(RELS.toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("xl/workbook.xml")); z.write(WORKBOOK.toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("xl/_rels/workbook.xml.rels")); z.write(WORKBOOK_RELS.toByteArray()); z.closeEntry()
-            z.putNextEntry(ZipEntry("xl/worksheets/sheet1.xml")); z.write(sheetXml(rows, imgs.isNotEmpty()).toByteArray()); z.closeEntry()
+            z.putNextEntry(ZipEntry("xl/worksheets/sheet1.xml")); z.write(sheetXml(rows, imgs.isNotEmpty(), collected.skipped).toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("xl/styles.xml")); z.write(STYLES.toByteArray()); z.closeEntry()
             if (imgs.isNotEmpty()) {
                 z.putNextEntry(ZipEntry("xl/worksheets/_rels/sheet1.xml.rels")); z.write(SHEET_RELS.toByteArray()); z.closeEntry()
@@ -133,23 +179,68 @@ object XlsxWriter {
         val contentType: String,
     )
 
-    /** 每行照片1/照片2 → 有字节且**格式可嵌入**则收集；行号 = 表头(0) + 数据行索引(1-based)；行高 = 该行 calcRowHeight（与 sheet 一致）。 */
-    private fun collectImages(rows: List<LedgerRow>, imageLoader: (String?) -> ByteArray?): List<Img> {
+    /**
+     * 收集结果：可嵌入的图片 + 因预算不足被跳过的单元格。
+     *
+     * ★ 必须把 skipped 带回给 sheetXml：跳过是**降级**，不是错误，用户得能在台账里看到
+     *   "这张为什么没图"，否则就是静默丢数据。
+     */
+    private class Collected(
+        val images: List<Img>,
+        /**
+         * (数据行在 [rows] 中的 0-based 下标, 列号)。
+         *
+         * ★ 别用工作表行号：`Img.row` 是 drawing 锚点用的 0-based 行（表头=0），而
+         *   单元格坐标 `r` 是 1-based（表头=1），两套坐标系差 1。曾经在这里混用，
+         *   结果"未嵌入"说明打在了**上一行**的单元格上（测试实测 3 处只命中 2 处）。
+         *   用 rows 下标做键最不容易错，取表时按同一个 i 查。
+         */
+        val skipped: Set<Pair<Int, Int>>,
+    )
+
+    /**
+     * 每行照片1/照片2 → 有字节且**格式可嵌入**则收集；行号 = 表头(0) + 数据行索引(1-based)；
+     * 行高 = 该行 calcRowHeight（与 sheet 一致）。
+     *
+     * ★ W2（issue #5）：累计字节超过 [maxImageBytes] 后**立即停止**，既不再把已超预算的
+     *   这一张塞进去，也不再为后续单元格调用 imageLoader —— 后者才是兜底的关键：
+     *   imageLoader 在 App 侧会解码 + 压 JPEG，继续调用等于继续分配内存，预算就成了摆设。
+     */
+    private fun collectImages(
+        rows: List<LedgerRow>,
+        imageLoader: (String?) -> ByteArray?,
+        maxImageBytes: Long,
+    ): Collected {
         val out = mutableListOf<Img>()
+        val skipped = mutableSetOf<Pair<Int, Int>>()
+        var totalBytes = 0L
+        var budgetExhausted = false
         rows.forEachIndexed { i, r ->
             val rowH = calcRowHeight(r.description)
             listOf(r.photo1Ref to COL_P1, r.photo2Ref to COL_P2).forEach { (ref, col) ->
-                val b = ref?.let { runCatching { imageLoader(it) }.getOrNull() }
+                if (ref == null) return@forEach
+                if (budgetExhausted) {
+                    skipped.add(i to col)
+                    return@forEach
+                }
+                val b = runCatching { imageLoader(ref) }.getOrNull()
                 if (b != null && b.isNotEmpty()) {
                     // ★ W1：识别不出格式（WebP/HEIC/GIF/损坏字节）→ 跳过嵌入。
                     //   照片列已写文件名（photoLabel），信息不丢；绝不能写一个 Excel 不认的
                     //   ContentType 去换"看起来有图"，那会让整份台账打不开。
                     val fmt = imageFormat(b) ?: return@forEach
+                    if (totalBytes + b.size > maxImageBytes) {
+                        // 预算不够：这张不嵌入，并从此不再取图
+                        budgetExhausted = true
+                        skipped.add(i to col)
+                        return@forEach
+                    }
+                    totalBytes += b.size
                     out.add(Img(b, col, i + 1, rowH, fmt.first, fmt.second))
                 }
             }
         }
-        return out
+        return Collected(out, skipped)
     }
 
     /**
@@ -191,7 +282,11 @@ object XlsxWriter {
 
     private fun extOf(contentType: String): String = if (contentType.endsWith("png")) "png" else "jpg"
 
-    private fun sheetXml(rows: List<LedgerRow>, hasDrawing: Boolean): String {
+    private fun sheetXml(
+        rows: List<LedgerRow>,
+        hasDrawing: Boolean,
+        skipped: Set<Pair<Int, Int>> = emptySet(),
+    ): String {
         val sb = StringBuilder()
         sb.append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         sb.append("""<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">""")
@@ -206,15 +301,16 @@ object XlsxWriter {
         sb.append(headerRowXml())
         rows.forEachIndexed { i, r ->
             val rowH = calcRowHeight(r.description)
-            sb.append(dataRowXml(i + 2, listOf(
+            val sheetRow = i + 2   // 表头占第 1 行
+            sb.append(dataRowXml(sheetRow, listOf(
                 // 序号用数字单元格（不是文本）：否则 Excel 报"数字以文本存储"且无法求和排序
                 Cell.Number((i + 1).toString()),
                 dateCell(r.dateTime),                       // B 列：真实日期（P2-2），失败回退文本
                 dateCell(r.endTime),                        // C 列：真实日期（P2-2），失败回退文本
                 Cell.Str(r.location),
                 Cell.Str(r.description, styled = true),   // E 列 wrapText
-                Cell.Str(photoLabel(r, r.photo1Ref)),
-                Cell.Str(photoLabel(r, r.photo2Ref)),
+                Cell.Str(photoLabel(r, r.photo1Ref, (i to COL_P1) in skipped)),
+                Cell.Str(photoLabel(r, r.photo2Ref, (i to COL_P2) in skipped)),
             ), rowH))
         }
         sb.append("</sheetData>")
@@ -284,10 +380,13 @@ object XlsxWriter {
         parseDateTime(s)?.let { Cell.DateTime(toExcelSerial(it)) } ?: Cell.Str(s)
 
     /** ★ 2026-10-18 P1-3：照片列文本 = "文件夹名/文件名"，消除 ZIP 内跨事件文件夹同名歧义；
-     *  无文件夹名（旧调用/直接构造 LedgerRow）时仅写文件名，行为与改造前一致。 */
-    private fun photoLabel(r: LedgerRow, ref: String?): String {
+     *  无文件夹名（旧调用/直接构造 LedgerRow）时仅写文件名，行为与改造前一致。
+     *  ★ W2（issue #5）：`skippedNote=true` 时在文件名的"文件名"侧追加 [IMAGE_SKIPPED_NOTE] ——
+     *  说明放在文件名之后、文件夹名之后不动，便于用户按 "文件夹名/" 前缀筛选。 */
+    private fun photoLabel(r: LedgerRow, ref: String?, skippedNote: Boolean = false): String {
         val f = fileName(ref) ?: return ""
-        return if (r.folderName.isNotBlank()) "${r.folderName}/$f" else f
+        val label = if (r.folderName.isNotBlank()) "${r.folderName}/$f" else f
+        return if (skippedNote) label + IMAGE_SKIPPED_NOTE else label
     }
 
     /**
