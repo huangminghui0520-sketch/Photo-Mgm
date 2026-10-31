@@ -117,14 +117,19 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
             }
         }
         // 事件内多簇中心离散提示（CLUSTER_SPAN）
+        // ★ 2026-10-24 B3：同事件聚合为一条（附超距簇对数与涉及照片数），消除同文案重复刷屏
         for (e in timed) {
             val mine = clusters.filter { c -> c.photos.any { assigned[e.id]!!.contains(it.id) } }
+            val farPairs = mutableListOf<Pair<Cluster, Cluster>>()
             for (i in 0 until mine.size) for (j in i + 1 until mine.size) {
-                if (clusterDistance(mine[i], mine[j]) > maxDistanceM * 1.5) {
-                    interventions.add(Intervention(Kind.CLUSTER_SPAN,
-                        "事件「${e.eventType}」照片 GPS 跨度大，请核对",
-                        (mine[i].photos + mine[j].photos).map { it.id }.distinct()))
-                }
+                if (clusterDistance(mine[i], mine[j]) > maxDistanceM * 1.5) farPairs.add(mine[i] to mine[j])
+            }
+            if (farPairs.isNotEmpty()) {
+                val ids = farPairs.flatMap { it.first.photos + it.second.photos }.map { it.id }.distinct()
+                interventions.add(Intervention(
+                    Kind.CLUSTER_SPAN,
+                    "事件「${e.eventType}」有 ${farPairs.size} 组照片 GPS 跨度大（涉及 ${ids.size} 张），请核对",
+                    ids, listOf(e.id)))
             }
         }
         // 自动拆簇提示（§6.3 承诺、§6.4 遗漏 → 完善补回）
@@ -165,6 +170,10 @@ class EventClassifyEngine(private val maxDistanceM: Double = 50.0) {
      */
     private fun findWindow(t: Long, events: List<LogEvent>, dayStart: Long, backfillMs: Long): LogEvent? {
         if (t < dayStart) return null
+        // ★ 2026-10-31 崩溃修复：timed 为空（日志无可识别时间的事件）时，事件列表空 → events.last() 抛
+        //   NoSuchElementException，在 parseLogs 协程内无 try/catch → 应用直接关闭。
+        //   语义：无可归属事件 → 照片进未匹配池（与"待定事件人工指定时间后重算"一致），而非崩溃。
+        if (events.isEmpty()) return null
         val second = events.getOrNull(1)?.let { it.endTimeMs ?: it.startTimeMs!! }
         if (second != null && t < second) return events[0]
         // 补拍回看：记录时间 ≤ t 的最近一条事件（events 已按记录时间升序）

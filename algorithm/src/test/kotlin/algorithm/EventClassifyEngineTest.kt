@@ -205,4 +205,23 @@ class EventClassifyEngineTest {
             it.kind == Kind.CLUSTER_SPAN && it.photoIds.containsAll(listOf(11L, 12L))
         }, "簇内最早/最晚照片跨不同事件需提示核对")
     }
+
+    // ---- 2026-10-31 崩溃回归：日志无可识别时间（全部待定事件）+ 带时间照片 → 不崩溃、照片进未匹配 ----
+
+    @Test fun `全部事件无时间_带时间簇照片_不崩溃_进未匹配`() {
+        // 真实崩溃场景：timed 为空 → findWindow 空列表 events.last() 抛 NoSuchElementException（parseLogs 协程内未捕获 → 应用关闭）
+        val pending1 = LogEvent(1, null, null, emptyList(), "K1+000", "待定1", "无时间事件1")
+        val pending2 = LogEvent(2, null, null, emptyList(), "K2+000", "待定2", "无时间事件2")
+        val c = cluster(11, at(9, 30))   // 带 GPS + 精确时间
+        val r = engine.classify(listOf(pending1, pending2), listOf(c), emptyList(), date)
+        assertEquals(listOf(1, 2), r.pendingEventIds, "全部事件进待定区")
+        assertTrue(r.unmatched.contains(11L), "无归属事件 → 簇照片进未匹配池，不崩溃")
+    }
+
+    @Test fun `全部事件无时间_无GPS单张带时间_不崩溃_进未匹配`() {
+        val pending = LogEvent(1, null, null, emptyList(), "K1+000", "待定", "无时间事件")
+        val s = photo(21, at(9, 30), 23.0, 113.0)
+        val r = engine.classify(listOf(pending), emptyList(), listOf(s), date)
+        assertTrue(r.unmatched.contains(21L), "无归属事件 → 单张照片进未匹配池，不崩溃")
+    }
 }
