@@ -124,12 +124,20 @@ internal object DerivedNames {
         return suffixes.any { lower.contains("_$it") }
     }
 
-    /** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2。 */
+    /** 派生优先级分数：越小越优先。主图=0 < 仅_original=1 < 仅_compressed=2 < 其余加工后缀=30+。 */
     fun score(name: String): Int {
         val lower = name.lowercase()
         var s = 0
         if (lower.contains("_original")) s += 1
         if (lower.contains("_compressed")) s += 2
+        // ★ 2026-10-31 审查修复：[suffixes] 共 8 个词，但此前只给前两个计分，其余 6 个
+        //   （_edited/_modified/_optimized/_resized/_缩略/_压缩/_原图）与主图同为 0 分。
+        //   dedupDerived 以 sortedBy{score}.first() 选主图（稳定排序），同分时"列表中靠前者"胜出
+        //   → 加工副本可能当主图、真主图反被判为副本丢弃；KEEP_PLAIN 也会选中 _edited 而非 _original。
+        //   加工副本一律低于主图（分数更大），按下标递增赋分确保各后缀互不并列。
+        for (i in 2 until suffixes.size) {
+            if (lower.contains("_${suffixes[i]}")) s += 10 * (i + 1)
+        }
         return s
     }
 

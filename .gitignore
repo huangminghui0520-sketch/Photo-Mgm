@@ -24,6 +24,8 @@ gps_test_photos/
 gps_test_photos_valid/
 shots/
 *.py
+# ★ 例外：scripts/ 下的 CI 检查脚本必须入库（上面 *.py 是忽略本地临时脚本用的）
+!scripts/*.py
 
 # 签名密钥（本地，绝不入库）
 keystore/

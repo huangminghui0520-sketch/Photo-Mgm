@@ -26,6 +26,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # ★ 2026-10-31 系统性防护：把「吞掉协程取消信号」变成 CI 可拦截的类别。
+      #   CancellationException 继承 IllegalStateException，会被 catch (Exception) 与 runCatching
+      #   静默吞掉——本轮 S1/S2 正是这样漏掉的。本步骤只依赖 python3，在编译前几秒内失败，
+      #   不必等人肉 review。规则与豁免方式见 scripts/check-cancellation.py 顶部说明。
+      - name: Check coroutine cancellation handling
+        run: python3 scripts/check-cancellation.py app algorithm data
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:

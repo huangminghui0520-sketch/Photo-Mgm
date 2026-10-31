@@ -17,8 +17,6 @@ import algorithm.model.LogEvent
 import android.app.Application
 import android.content.ContentUris
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.MediaStore
 import android.util.Log
@@ -1025,41 +1023,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(marked = map) }
     }
 
-    // ---------- 台账照片字节供给（§7.3 Excel 嵌入照片） ----------
-
-    /**
-     * 台账照片读取：sourceRef（物理路径 / content uri）→ 原图字节 → 压缩小图（≤480px JPEG85），
-     * 控制 xlsx 体积。读不到返回 null（该照片单元格只留文件名）。
-     */
-    private fun readPhotoBytes(ref: String): ByteArray? {
-        val raw = runCatching {
-            if (ref.startsWith("content://")) {
-                getApp().contentResolver.openInputStream(Uri.parse(ref))?.use { it.readBytes() }
-            } else File(ref).inputStream().use { it.readBytes() }
-        }.getOrNull() ?: return null
-        return compressForExcel(raw)
-    }
-
-    private fun compressForExcel(bytes: ByteArray): ByteArray {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return bytes
-        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
-        var sample = 1
-        while (maxDim / (sample * 2) >= 480) sample *= 2
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return bytes
-        val scaled = if (bmp.width > 480 || bmp.height > 480) {
-            val s = 480f / maxOf(bmp.width, bmp.height)
-            Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt().coerceAtLeast(1),
-                (bmp.height * s).toInt().coerceAtLeast(1), true)
-        } else bmp
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
-        if (scaled !== bmp) bmp.recycle()
-        scaled.recycle()
-        return out.toByteArray()
-    }
+    /** ★ 2026-10-31 审查：原「台账照片字节供给」段（readPhotoBytes / compressForExcel）已删除。
+     *  全仓库无任何调用方（台账图片实际走 prepareLedger → ImageUtils.process），属死代码；
+     *  且它与现行实现重复定义了一套压缩参数（480px JPEG85 vs 400×300 JPEG50），
+     *  留着会误导后续维护者改错地方。 */
 
     /** 合并 overrideMap 后的事件照片表（§8.3 移动兜底）。target=-1（移除）→ 从所有事件移除、不归入任何事件。 */
     fun effectiveMap(c: ClassifyResult): Map<Int, List<Long>> {
