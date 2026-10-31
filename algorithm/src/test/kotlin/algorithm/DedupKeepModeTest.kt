@@ -310,7 +310,7 @@ class DedupKeepModeTest {
     fun `CLUSTER_SPAN 同事件聚合为一条`() {
         // 构造：巡查日当天 08:20 左右，事件1 拥有三个相距 >75m 的簇 → 3 对超距 → 聚合为 1 条
         val dayStart = java.time.LocalDate.of(2026, 10, 24).atStartOfDay()
-            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
         val t = dayStart + 30_000_000L
         val e = LogEventHelper.event(1, "桥下空间巡查", "K117+430M", t)
         val c1 = Cluster(listOf(photo(1, "IMG_20261024_084736478.jpg", t, 23.29, 113.02)), t, 23.29, 113.02, emptyList())

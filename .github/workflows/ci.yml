@@ -1,8 +1,8 @@
 name: CI
 
 # 与 Build APK（build-apk.yml，只出包）分开的两类检查：
-#   1. static-guards：纯 python3，几秒钟出结果，在编译之前拦住两类"人肉 review 靠不住"的问题
-#      ——吞掉协程取消信号、被跳过的测试不可溯源；
+#   1. static-guards：纯 python3，几秒钟出结果，在编译之前拦住三类"人肉 review 靠不住"的问题
+#      ——吞掉协程取消信号、被跳过的测试不可溯源、隐式依赖设备默认时区；
 #   2. unit-test：algorithm（纯 JVM）+ app（Robolectric）单元测试。
 # ★ 必须监听 pull_request：否则分支上的检查只有推送到 main 才跑，PR 里永远是空的。
 on:
@@ -35,6 +35,7 @@ jobs:
           python3 --version
           git ls-files --error-unmatch scripts/check-cancellation.py
           git ls-files --error-unmatch scripts/check-ignore-policy.py
+          git ls-files --error-unmatch scripts/check-timezone.py
 
       # ★ 先跑内置样例自测：确认"判据本身没有退化"。
       #   门禁是自制词法分析器，没有外部依赖可对拍，最危险的回归是"规则还在、判据失效"
@@ -44,22 +45,24 @@ jobs:
         run: |
           python3 scripts/check-cancellation.py --selftest
           python3 scripts/check-ignore-policy.py --selftest
+          python3 scripts/check-timezone.py --selftest
 
       - name: 扫描 Kotlin 源码
         run: |
           python3 scripts/check-cancellation.py app algorithm data
           python3 scripts/check-ignore-policy.py app algorithm data
+          python3 scripts/check-timezone.py
 
   unit-test:
     name: Unit tests
     runs-on: ubuntu-24.04
-    # ★ TZ 必须固定（2026-10-31 首次跑测试时暴露）：
-    #   runner 默认 UTC，而生产代码在 7 处用 ZoneId.systemDefault() 把 epoch 毫秒解释成
-    #   本地时间（AlgorithmApi.parseLog / EventClassifyEngine×2 / LedgerEngine×2 /
-    #   LogParserEngine / ZipExporter，加上 app 侧 UI）。UTC 下台账日期列整体偏移 8 小时、
-    #   "当日零点"边界错位 → 5 条用例在本地(+08:00)绿、在 CI(UTC)红（已本地复现）。
-    #   固定 Asia/Shanghai 让 CI 与国内真机一致；"要不要把时区改成显式注入"是**产品级**
-    #   决策（牵动全链路语义），已单独立项待确认，不在本轮改动。
+    # ★ TZ 固定为兜底，**不是正确性依据**（issue #2 决策）。
+    #   历史：runner 默认 UTC，而生产代码曾有 7 处 ZoneId.systemDefault() 把 epoch 解释成本地
+    #   时间 → 台账日期列偏移 8 小时、"当日零点"边界错位（CI 首次跑测试即 5 条红）。
+    #   现在生产代码一律显式用 algorithm.AppZone.ID（Asia/Shanghai），并由
+    #   scripts/check-timezone.py 在 static-guards 里拦截"再写回 systemDefault()"；
+    #   测试侧用 TimeZone.setDefault 在进程内切换默认时区做验证，不依赖本变量。
+    #   保留它只为兜住"漏网的隐式依赖"在 CI 上不会表现成随机红。
     env:
       TZ: Asia/Shanghai
     steps:

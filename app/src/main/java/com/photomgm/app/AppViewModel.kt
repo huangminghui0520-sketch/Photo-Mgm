@@ -3,6 +3,7 @@
 package com.photomgm.app
 
 import algorithm.AlgorithmApi
+import algorithm.AppZone
 import algorithm.ClassifyResult
 import algorithm.CandidatePhoto
 import algorithm.DedupConfig
@@ -44,7 +45,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 data class UiState(
-    val date: LocalDate = LocalDate.now(),
+    val date: LocalDate = LocalDate.now(AppZone.ID),
     val sourceDirs: List<String> = emptyList(),
     val outputDir: String? = null,
     val namingTemplate: Int = 1,          // 0=事件类型，1=月日+巡查日志内容（默认1）
@@ -491,7 +492,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(busy = true, parsed = null, classify = null, ledger = null,
                     exportMessage = null, overrideMap = emptyMap(), progressStage = "解析日志中…")
             }
-            val p = AlgorithmApi.parseLog(s.logsText, s.date)
+            val p = AlgorithmApi.parseLog(s.logsText, s.date, AppZone.ID)
             // ── 照片获取：防线一（强制实时粗筛）决定 复用 or 完整重扫 ──
             if (s.sourceDirs.isEmpty()) {
                 _state.update { it.copy(parsed = p, busy = false, progressStage = null) }
@@ -529,7 +530,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // ★ 日志已解析 + 照片已就绪 → 自动重新分类（重新解析日志后无需手动点「生成分类」）
             _state.update { it.copy(parsed = p, progressStage = "分类中…") }
             val g = AlgorithmApi.gpsGroup(photos)
-            val c = AlgorithmApi.classify(p.events, g.clusters, g.singles, s.date, g.splitCount)
+            val c = AlgorithmApi.classify(p.events, g.clusters, g.singles, s.date, g.splitCount, zone = AppZone.ID)
             _state.update {
                 it.copy(coarseCount = coarse, photos = photos, classify = c, busy = false,
                     progressStage = null)
@@ -581,7 +582,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             store.overrideMap = emptyMap()
             _state.update { it.copy(busy = true, classify = null, overrideMap = emptyMap(), progressStage = "分类中…") }
             val g = AlgorithmApi.gpsGroup(s.photos)
-            val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount)
+            val c = AlgorithmApi.classify(parsed.events, g.clusters, g.singles, s.date, g.splitCount, zone = AppZone.ID)
             _state.update { it.copy(classify = c, busy = false, progressStage = null) }
             // ★ 2026-10-07：手动生成分类也写状态缓存（打开 App 恢复最新分类）
             saveStateCache(parsed, c, s.photos, s.coarseCount ?: s.photos.size)
@@ -600,7 +601,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val photoById: Map<Long, Photo> = s.photos.associateBy { it.id }
         // ★ 传入人工台账标记，否则「设为台账」在导出时被静默忽略；
         //   namingTemplate 保证台账照片列"文件夹名/文件名"前缀与 ZIP 分类文件夹一致（P1-3）
-        return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked, s.namingTemplate)
+        return AlgorithmApi.buildLedger(parsed.events, eventPhotoMap, photoById::get, s.marked, s.namingTemplate, AppZone.ID)
     }
 
     // ---------- ★ 2026-10-24 B1：输出层三态展开（分类不变，仅台账/ZIP 生效） ----------
@@ -742,6 +743,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             store.classifyCache = classify
             store.photosCache = photos
             store.coarseCountCache = coarseCount
+            // ★ issue #2：这四份缓存里的 epoch 都是按业务时区算出来的，写缓存时打上版本位；
+            //   读侧发现版本位与当前业务时区不一致 → 视为无缓存，重算（见 SettingsStore.markCacheZone）。
+            store.markCacheZone()
         }
     }
 
@@ -886,7 +890,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         // ★ 2026-10-08 P0-3：临时文件声明移到 try 外——导出失败也必须清理（含原图，可达几十 MB）
         val fileName = "照片分类_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_" +
-                java.time.LocalDateTime.now()
+                java.time.LocalDateTime.now(AppZone.ID)
                     .format(java.time.format.DateTimeFormatter.ofPattern("HHmmss")) + ".zip"
         // ★ 断点续传状态文件与输出位置解耦（放 app 私有 files 目录），避免输出目录切换丢失
         val stateFile = File(getApp().filesDir, ".export_state_${s.date}.json")
@@ -924,7 +928,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             // ★ 台账文件名含巡查日期 + 时分秒：区分"导出时刻"与"巡查日期"，
             //   并避免同日二次导出时同名被静默覆盖（SAF findFile 会复用同名文档）。
-            val now = java.time.LocalDateTime.now()
+            val now = java.time.LocalDateTime.now(AppZone.ID)
             val stamp = now.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
             val xlsxName = "巡查台账_${s.date.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"))}_$stamp.xlsx"
             val extraFiles = if (xlsxBytes != null && xlsxBytes.isNotEmpty()) mapOf(xlsxName to xlsxBytes) else emptyMap()
@@ -940,7 +944,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } else null
 
             val r = AlgorithmApi.exportZip(parsed.events, finalMap, finalUnmatched,
-                photoById::get, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles) { frac, _ ->
+                photoById::get, s.namingTemplate, tmpZip, stateFile, extraFiles = extraFiles,
+                zone = AppZone.ID) { frac, _ ->
                 _state.update { it.copy(exportProgress = 0.6f + 0.4f * frac) }
             }
             // ★ 2026-10-18 P0-2：copyToOutput 返回 null = 输出目录不可写，结果里需提示；

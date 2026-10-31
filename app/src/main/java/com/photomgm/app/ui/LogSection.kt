@@ -33,7 +33,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.photomgm.app.AppViewModel
 import java.time.Instant
-import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 // ──────────────────────────────────────────────────────────────────
@@ -291,7 +290,7 @@ fun LogSection(
 private val tf = DateTimeFormatter.ofPattern("HH:mm")
 private fun hm(ms: Long?): String =
     ms?.let {
-        Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault()).format(tf)
+        Instant.ofEpochMilli(it).atZone(algorithm.AppZone.ID).format(tf)
     } ?: "无时间"
 
 private fun fmtRange(start: Long?, end: Long?): String =

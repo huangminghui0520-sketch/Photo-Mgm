@@ -27,7 +27,8 @@ class GpsEndToEndRobolectricTest {
     private val root = File("D:/Photo-Mgm/Photo-Mgm/gps_test_photos")
     private val reader = ExifPhotoReader()
     private val date = LocalDate.of(2026, 8, 17)
-    private val zone = ZoneId.systemDefault()
+    // ★ 测试显式指定业务时区（issue #2）：不依赖 runner 的 TZ 环境变量。
+    private val zone = ZoneId.of("Asia/Shanghai")
 
     private fun photo(id: Long, name: String): Photo {
         val p = File(root, name)

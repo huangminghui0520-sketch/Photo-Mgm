@@ -20,9 +20,17 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-class LedgerEngine {
+/**
+ * 台账生成。
+ *
+ * @param zone 把 epoch 毫秒渲染成「yyyy-MM-dd HH:mm」所用时区。
+ *             ★ 必须与解析（[AlgorithmApi.parseLog]）用同一个 zone：解析负责"挂钟 → epoch"，
+ *             本类负责"epoch → 挂钟"，两侧时区不一致会让日期列整体偏移（issue #2）。
+ *             默认 [AppZone.ID]（北京时间），生产调用点显式传参。
+ */
+class LedgerEngine(private val zone: ZoneId = AppZone.ID) {
     /** ZIP 文件夹命名器（P1-3：与导出打包共用命名规则，保证台账照片列前缀与 ZIP 内路径一致）。 */
-    private val folderNamer = ZipExporter()
+    private val folderNamer = ZipExporter(zone)
 
     /**
      * 生成台账行（每事件一行）。
@@ -64,7 +72,7 @@ class LedgerEngine {
     /** 日期列：事件开始时间 → "yyyy-MM-dd HH:mm"（含巡查日期；无开始时间 → 空串）。 */
     private fun formatDateTime(e: LogEvent): String {
         val s = e.startTimeMs ?: return ""
-        return Instant.ofEpochMilli(s).atZone(ZoneId.systemDefault()).format(DATE_TIME)
+        return Instant.ofEpochMilli(s).atZone(zone).format(DATE_TIME)
     }
 
     /** 结束时间列：事件结束时间 → "yyyy-MM-dd HH:mm"；无结束时间或单时间点事件 → 空串。 */
@@ -72,7 +80,7 @@ class LedgerEngine {
         val s = e.endTimeMs ?: return ""
         // 单时间点事件（起止相同）：结束时间留空，避免 "08:30 ~ 08:30" 冗余
         if (s == e.startTimeMs) return ""
-        return Instant.ofEpochMilli(s).atZone(ZoneId.systemDefault()).format(DATE_TIME)
+        return Instant.ofEpochMilli(s).atZone(zone).format(DATE_TIME)
     }
 
     private companion object {

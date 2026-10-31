@@ -80,7 +80,6 @@ import algorithm.model.LogEvent
 import algorithm.model.Photo
 import com.photomgm.app.AppViewModel
 import java.time.Instant
-import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
 
@@ -570,7 +569,7 @@ internal fun Thumb(
 // ──────────────────────────────────────────────────────────────────
 private val fmt = DateTimeFormatter.ofPattern("HH:mm")
 private fun fmtRange(start: Long?, end: Long?): String {
-    val zone = ZoneId.systemDefault()
+    val zone = algorithm.AppZone.ID
     val s = start?.let { Instant.ofEpochMilli(it).atZone(zone).format(fmt) } ?: return "无时间"
     val e = end ?: return s
     if (e == start) return s
@@ -1022,7 +1021,7 @@ private fun PhotoTile(
             ) {
                 Text(
                     tileTimeFmt.format(
-                        Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault())
+                        Instant.ofEpochMilli(ms).atZone(algorithm.AppZone.ID)
                     ),
                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                     color = Color.White,

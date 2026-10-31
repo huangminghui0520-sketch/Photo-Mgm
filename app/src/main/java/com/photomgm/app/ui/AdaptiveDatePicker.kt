@@ -68,7 +68,7 @@ fun AdaptiveDatePicker(
     var year by rememberSaveable { mutableIntStateOf(initialDate.year) }
     var month by rememberSaveable { mutableIntStateOf(initialDate.monthValue) }
     var selectedEpochDay by rememberSaveable { mutableLongStateOf(initialDate.toEpochDay()) }
-    val today = LocalDate.now()
+    val today = LocalDate.now(algorithm.AppZone.ID)
 
     // 由 Int/Int 组装 YearMonth（纯函数，无保存问题）
     val displayedYm = YearMonth.of(year, month)

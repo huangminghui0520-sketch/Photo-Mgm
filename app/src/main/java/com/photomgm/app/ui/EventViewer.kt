@@ -65,7 +65,6 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import algorithm.model.Photo
 import java.time.Instant
-import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.launch
 
@@ -264,7 +263,7 @@ internal fun ViewerContent(
                     Text(
                         "${pagerState.currentPage + 1} / ${photos.size}" +
                                 current.captureTimeMs?.let {
-                                    " · " + Instant.ofEpochMilli(it).atZone(ZoneId.systemDefault())
+                                    " · " + Instant.ofEpochMilli(it).atZone(algorithm.AppZone.ID)
                                         .format(viewerTimeFmt)
                                 }.orEmpty(),
                         style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
