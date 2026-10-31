@@ -198,7 +198,7 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
     }
 
     private fun sanitize(name: String): String =
-        name.replace(Regex("""[\\\/:*?\"<>|]"""), "_")
+        name.replace(Regex("""[\\/:*?"<>|]"""), "_")
 
     private fun readCompleted(f: File?): Completed? {
         if (f == null || !f.isFile) return null
@@ -343,6 +343,6 @@ class ZipExporter(private val zone: ZoneId = ZoneId.systemDefault()) {
         /** 未匹配照片的固定文件夹（P2-4：99_ 前缀保证按名称排序时始终最后）。 */
         const val UNMATCHED_FOLDER = "99_未分类"
         /** 开头时间前缀：上午/下午可选 + 时点 + 可选"至终点" + 尾随空格 */
-        val LEADING_TIME_RE = Regex("""^(?:上午|下午)?\\d{1,2}[点时:：]\\d{0,2}(?:分)?(?:至\\d{1,2}[点时:：]\\d{0,2}(?:分)?)?\\s*""")
+        val LEADING_TIME_RE = Regex("""^(?:上午|下午)?\d{1,2}[点时:：]\d{0,2}(?:分)?(?:至\d{1,2}[点时:：]\d{0,2}(?:分)?)?\s*""")
     }
 }
