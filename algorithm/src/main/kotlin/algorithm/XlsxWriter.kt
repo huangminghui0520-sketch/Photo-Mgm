@@ -30,6 +30,15 @@ object XlsxWriter {
     private const val HEADER_ROW_H = 25
     private const val DATA_ROW_H_MIN = 81
 
+    /**
+     * 数据行行高上限（磅）。
+     * ★ 2026-10-31 审查修复：Excel/WPS 行高规范上限为 **409.5pt**，且本文件对数据行写
+     *   `customHeight="1"`（禁止 Excel 自动收敛），因此 `ht` 一旦超限，打开时会触发
+     *   「发现部分内容有问题」的修复提示，修复失败则整份台账不可用。
+     *   下限已有 DATA_ROW_H_MIN 兜底，此处补上界，写入前一律钳制。
+     */
+    private const val DATA_ROW_H_MAX = 409
+
     /** E列（日志内容）列宽 60 字符；估算每行可容纳约 30 个中文字符（11pt 字体）。 */
     private const val CHARS_PER_LINE = 30
     /** 每行文本约 16 磅 + 上下边距 8 磅。 */
@@ -78,7 +87,9 @@ object XlsxWriter {
         val byLength = (units(description) + CHARS_PER_LINE - 1) / CHARS_PER_LINE
         val lines = maxOf(byNewline, byLength)
         val textHeight = (lines * LINE_HEIGHT_PT + TEXT_PADDING_PT) * 1.10   // 10% 缓冲防裁切
-        return maxOf(DATA_ROW_H_MIN, textHeight.toInt())
+        // ★ 2026-10-31：钳到 DATA_ROW_H_MAX。日志含 23 个换行段（或约 690 个半角字符）即会超过
+        //   Excel 409.5pt 上限，超长内容宁可在单元格内被裁切，也不能让整份 xlsx 打不开。
+        return maxOf(DATA_ROW_H_MIN, minOf(DATA_ROW_H_MAX, textHeight.toInt()))
     }
 
     /** 图片锚定：照片1 列=5、照片2 列=6（0-based F/G）；显示 1 列 × 1 行。 */
@@ -103,8 +114,7 @@ object XlsxWriter {
                 z.putNextEntry(ZipEntry("xl/drawings/drawing1.xml")); z.write(drawingXml(imgs).toByteArray()); z.closeEntry()
                 z.putNextEntry(ZipEntry("xl/drawings/_rels/drawing1.xml.rels")); z.write(drawingRels(imgs).toByteArray()); z.closeEntry()
                 imgs.forEachIndexed { idx, img ->
-                    val (ext, _) = imageFormat(img.bytes)
-                    z.putNextEntry(ZipEntry("xl/media/image${idx + 1}.$ext")); z.write(img.bytes); z.closeEntry()
+                    z.putNextEntry(ZipEntry("xl/media/image${idx + 1}.${img.ext}")); z.write(img.bytes); z.closeEntry()
                 }
             }
         }
@@ -112,29 +122,55 @@ object XlsxWriter {
 
     // ---------- 图片收集 ----------
 
-    /** ★ 2026-10-08 增加 rowHeightPt：该图所在数据行的动态行高（磅），用于 drawing 垂直居中。 */
-    private data class Img(val bytes: ByteArray, val col: Int, val row: Int, val rowHeightPt: Int)
+    /** ★ 2026-10-08 增加 rowHeightPt：该图所在数据行的动态行高（磅），用于 drawing 垂直居中。
+     *  ★ 2026-10-31 W1：ext/contentType 随图一起定下来，避免后续每处都重新嗅探、也杜绝空断言。 */
+    private data class Img(
+        val bytes: ByteArray,
+        val col: Int,
+        val row: Int,
+        val rowHeightPt: Int,
+        val ext: String,
+        val contentType: String,
+    )
 
-    /** 每行照片1/照片2 → 有字节则收集；行号 = 表头(0) + 数据行索引(1-based)；行高 = 该行 calcRowHeight（与 sheet 一致）。 */
+    /** 每行照片1/照片2 → 有字节且**格式可嵌入**则收集；行号 = 表头(0) + 数据行索引(1-based)；行高 = 该行 calcRowHeight（与 sheet 一致）。 */
     private fun collectImages(rows: List<LedgerRow>, imageLoader: (String?) -> ByteArray?): List<Img> {
         val out = mutableListOf<Img>()
         rows.forEachIndexed { i, r ->
             val rowH = calcRowHeight(r.description)
             listOf(r.photo1Ref to COL_P1, r.photo2Ref to COL_P2).forEach { (ref, col) ->
                 val b = ref?.let { runCatching { imageLoader(it) }.getOrNull() }
-                if (b != null && b.isNotEmpty()) out.add(Img(b, col, i + 1, rowH))
+                if (b != null && b.isNotEmpty()) {
+                    // ★ W1：识别不出格式（WebP/HEIC/GIF/损坏字节）→ 跳过嵌入。
+                    //   照片列已写文件名（photoLabel），信息不丢；绝不能写一个 Excel 不认的
+                    //   ContentType 去换"看起来有图"，那会让整份台账打不开。
+                    val fmt = imageFormat(b) ?: return@forEach
+                    out.add(Img(b, col, i + 1, rowH, fmt.first, fmt.second))
+                }
             }
         }
         return out
     }
 
-    /** 按文件头判断格式：JPEG(FF D8 FF) / PNG(89 50 4E 47)；其他按 PNG 兜底。 */
-    private fun imageFormat(bytes: ByteArray): Pair<String, String> = when {
+    /**
+     * 按文件头判断格式；**返回 null = 不可嵌入**（Excel/WPS 不支持该格式）。
+     *
+     * ★ 2026-10-31 审查修复（W1）：原实现把无法识别的字节一律按 PNG 声明——
+     *   WebP（RIFF….WEBP）/ HEIC（ftyp heic）/ GIF / 损坏字节都被写成 `.png` + `image/png`，
+     *   Excel 打开发现内容与声明不符 → 报「发现部分内容有问题」，修复失败则**整表不可用**。
+     *   与 F1（行高超 409.5pt）属同一类故障面，故本轮一并处理。
+     *
+     * 这里只放行 Excel 明确支持的 JPEG / PNG。转码（WebP/HEIC → JPEG）不属于本层职责：
+     * 核心层是纯 Kotlin（无平台解码器、需保持 PC 可移植），转码由调用方在 imageLoader 内完成
+     * （App 侧见 ImageUtils.decodeForThumbnail：ImageDecoder 解码后压 JPEG）。转码也失败的极少数
+     * 情况（如 API<28 的 HEIC）退化为"单元格仅文件名"——这是最后一层兜底，不是新故障。
+     */
+    private fun imageFormat(bytes: ByteArray): Pair<String, String>? = when {
         bytes.size >= 3 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte() ->
             "jpg" to "image/jpeg"
         bytes.size >= 8 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() &&
             bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte() -> "png" to "image/png"
-        else -> "png" to "image/png"
+        else -> null
     }
 
     // ---------- 部件生成 ----------
@@ -144,7 +180,7 @@ object XlsxWriter {
         sb.append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         sb.append("""<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>""")
         if (imgs.isNotEmpty()) {
-            imgs.map { imageFormat(it.bytes).second }.distinct().forEach { ct ->
+            imgs.map { it.contentType }.distinct().forEach { ct ->
                 sb.append("""<Default Extension="${extOf(ct)}" ContentType="$ct"/>""")
             }
             sb.append("""<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>""")
@@ -293,8 +329,7 @@ object XlsxWriter {
         sb.append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         sb.append("""<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">""")
         imgs.forEachIndexed { i, img ->
-            val (ext, _) = imageFormat(img.bytes)
-            sb.append("""<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${i + 1}.$ext"/>""")
+            sb.append("""<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${i + 1}.${img.ext}"/>""")
         }
         sb.append("</Relationships>")
         return sb.toString()

@@ -128,10 +128,25 @@ object PhotoIngest {
         /** 是否为 _original（水印相机原图语义，独立照片候选）。 */
         fun isOriginal(name: String): Boolean = DerivedNames.isOriginal(name)
 
-        // 先按基名分组（保序），再逐组按方案B' 判定
+        /**
+         * 分组键 = **所在目录** + 基名。
+         * ★ 2026-10-31 审查修复：原键只取基名，会把「不同目录下的同名文件」误当作同一张照片的
+         *   主图与派生副本，于是其中一张**真实照片**被判为副本而静默丢弃（相机重置计数后重新
+         *   拍摄的 IMG_0001.jpg、或多个源目录下的备份目录同名文件，都是典型场景）。
+         *   加目录维度后各目录独立判定，跨目录同名互不干扰。
+         *   边界：sourceRef 取 RELATIVE_PATH（DATA 列为空）时目录部分与物理路径写法不同，
+         *   同一目录内混用两种取值会拆成两组——保守不去重，不会造成误删。
+         *   分隔符用 '/'：displayName 取自 MediaStore DISPLAY_NAME，不含 '/'，故拼接无歧义。
+         */
+        fun groupKey(c: CandidatePhoto): String {
+            val dir = c.sourceRef.substringBeforeLast('/')
+            return "$dir/${baseName(c.displayName)}"
+        }
+
+        // 先按「目录 + 基名」分组（保序），再逐组按方案B' 判定
         val groups = LinkedHashMap<String, MutableList<CandidatePhoto>>()
         for (c in candidates) {
-            groups.getOrPut(baseName(c.displayName)) { mutableListOf() }.add(c)
+            groups.getOrPut(groupKey(c)) { mutableListOf() }.add(c)
         }
         val out = mutableListOf<CandidatePhoto>()
         var merged = 0
